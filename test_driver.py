@@ -11,6 +11,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
+import driver
 from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
 
@@ -456,7 +457,13 @@ class SyncEngineStartupTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root)
 
+    def _use_full_crawl(self):
+        """Startup behavior below describes crawl_mode: full; lazy is covered
+        separately in LazyCrawlStartupTests."""
+        self.engine.crawl_mode = "full"
+
     def test_start_uses_persistent_cache_without_initial_scan(self):
+        self._use_full_crawl()
         self.state.upsert_entry(
             {
                 "path": "/docs",
@@ -508,6 +515,7 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertTrue(reentered)
 
     def test_start_performs_initial_scan_on_first_run(self):
+        self._use_full_crawl()
         self.engine.start()
 
         self.engine.initial_scan.assert_called_once()
@@ -862,6 +870,257 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             self.assertTrue(engine._path_allowed("/outside/file.txt"))
         finally:
             engine.shutdown()
+
+
+class FakeNode:
+    """Stand-in for pyicloud's DriveNode, covering only what list_directory uses."""
+
+    def __init__(self, name, node_type="file", drivewsid=None, size=0, etag="etag-1"):
+        self.name = name
+        self.data = {
+            "name": name,
+            "type": node_type.upper(),
+            "drivewsid": drivewsid or f"remote-{name}",
+            "docwsid": f"doc-{name}",
+            "etag": etag,
+            "zone": "zone",
+            "size": size,
+        }
+        self.children = []
+
+    def get_children(self, force=False):
+        return self.children
+
+
+class LazyDirectoryListingTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.api = Mock()
+        self.remote_root = FakeNode("root", node_type="folder", drivewsid="remote-root")
+        self.api.drive.root = self.remote_root
+        self.engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            Mock(),
+            crawl_mode="lazy",
+        )
+        self.engine._schedule_download = Mock()
+
+    def tearDown(self):
+        self.engine.shutdown()
+        shutil.rmtree(self.root)
+
+    def test_start_skips_remote_crawl_and_only_creates_the_root(self):
+        self.engine.initial_scan = Mock()
+        self.engine._schedule_all_unhydrated = Mock()
+        self.engine._start_background_threads = Mock()
+
+        self.engine.start()
+
+        self.engine.initial_scan.assert_not_called()
+        self.engine._schedule_all_unhydrated.assert_not_called()
+        self.assertTrue(self.mirror.is_dir("/"))
+
+    def test_listing_a_folder_does_not_download_its_files(self):
+        self.remote_root.children = [
+            FakeNode("notes.txt", size=12),
+            FakeNode("Docs", node_type="folder"),
+        ]
+
+        self.engine.list_directory("/")
+
+        self.assertIsNotNone(self.state.get_entry("/notes.txt"))
+        self.assertIsNotNone(self.state.get_entry("/Docs"))
+        self.assertEqual(self.state.get_entry("/notes.txt")["size"], 12)
+        self.assertFalse(self.state.get_entry("/notes.txt")["hydrated"])
+        self.engine._schedule_download.assert_not_called()
+
+    def test_listing_is_not_recursive(self):
+        docs = FakeNode("Docs", node_type="folder")
+        docs.children = [FakeNode("deep.txt")]
+        self.remote_root.children = [docs]
+
+        self.engine.list_directory("/")
+
+        self.assertIsNotNone(self.state.get_entry("/Docs"))
+        self.assertIsNone(self.state.get_entry("/Docs/deep.txt"))
+
+    def test_fresh_listing_is_not_requested_again(self):
+        self.remote_root.get_children = Mock(return_value=[])
+
+        self.engine.list_directory("/")
+        self.engine.list_directory("/")
+
+        self.remote_root.get_children.assert_called_once()
+
+    def test_force_re_lists_a_fresh_folder(self):
+        self.remote_root.get_children = Mock(return_value=[])
+
+        self.engine.list_directory("/")
+        self.engine.list_directory("/", force=True)
+
+        self.assertEqual(self.remote_root.get_children.call_count, 2)
+
+    def test_sweep_is_restricted_to_direct_children(self):
+        self.remote_root.children = [
+            FakeNode("Docs", node_type="folder"),
+            FakeNode("gone.txt"),
+        ]
+        self.engine.list_directory("/")
+        self.mirror.write("/Docs/deep.txt", b"x", 0)
+        self.state.upsert_entry(
+            {
+                "path": "/Docs/deep.txt",
+                "type": "file",
+                "parent_path": "/Docs",
+                "remote_drivewsid": "remote-deep",
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/Docs/deep.txt",
+            }
+        )
+
+        # "gone.txt" disappeared remotely and must go; "/Docs/deep.txt" is not
+        # a direct child of "/" and must survive this folder's sweep.
+        self.remote_root.children = [FakeNode("Docs", node_type="folder")]
+        self.engine.list_directory("/", force=True)
+
+        self.assertIsNone(self.state.get_entry("/gone.txt"))
+        self.assertIsNotNone(self.state.get_entry("/Docs/deep.txt"))
+        self.assertTrue(self.mirror.exists("/Docs/deep.txt"))
+
+    def test_subfolder_is_listed_from_its_remote_id_without_walking_the_root(self):
+        self.remote_root.children = [FakeNode("Docs", node_type="folder", drivewsid="remote-Docs")]
+        self.engine.list_directory("/")
+
+        docs = FakeNode("Docs", node_type="folder", drivewsid="remote-Docs")
+        docs.children = [FakeNode("deep.txt", size=4)]
+        built = {}
+
+        def fake_drive_node(connection, data):
+            built["drivewsid"] = data["drivewsid"]
+            return docs
+
+        original = driver.DriveNode
+        driver.DriveNode = fake_drive_node
+        try:
+            self.engine.list_directory("/Docs")
+        finally:
+            driver.DriveNode = original
+
+        self.assertEqual(built["drivewsid"], "remote-Docs")
+        self.assertIsNotNone(self.state.get_entry("/Docs/deep.txt"))
+        self.engine._schedule_download.assert_not_called()
+
+    def test_failed_request_leaves_the_folder_unlisted(self):
+        self.remote_root.get_children = Mock(side_effect=RuntimeError("network down"))
+
+        self.engine.list_directory("/")
+
+        self.assertIsNone(self.state.get_folder_listing("/"))
+
+    def test_local_only_folder_is_marked_listed_without_a_request(self):
+        self.mirror.ensure_dir("/local")
+        self.state.upsert_entry(
+            {
+                "path": "/local",
+                "type": "folder",
+                "parent_path": "/",
+                "remote_drivewsid": None,
+                "hydrated": True,
+                "dirty": True,
+                "tombstone": False,
+                "synced_path": None,
+            }
+        )
+
+        self.engine.list_directory("/local")
+
+        self.assertIsNotNone(self.state.get_folder_listing("/local"))
+
+    def test_unknown_folder_is_not_marked_listed(self):
+        self.engine.list_directory("/never-seen")
+
+        self.assertIsNone(self.state.get_folder_listing("/never-seen"))
+
+    def test_removing_a_subtree_forgets_its_listing_markers(self):
+        self.state.mark_folder_listed("/Docs", "remote-Docs")
+        self.state.mark_folder_listed("/Docs/Sub", "remote-Sub")
+
+        self.state.remove_subtree("/Docs")
+
+        self.assertIsNone(self.state.get_folder_listing("/Docs"))
+        self.assertIsNone(self.state.get_folder_listing("/Docs/Sub"))
+
+    def test_lazy_refresh_only_touches_folders_already_listed(self):
+        self.engine.list_directory("/")
+        self.engine.list_directory = Mock()
+
+        self.engine.run_refresh("manual", force=True)
+
+        self.engine.list_directory.assert_called_once_with("/", force=True)
+
+    def test_tracker_ignore_marker_is_created_in_the_mirror(self):
+        self.assertTrue(os.path.exists(os.path.join(self.mirror.root, ".trackerignore")))
+
+
+class LazyFuseListingTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.api = Mock()
+        self.remote_root = FakeNode("root", node_type="folder", drivewsid="remote-root")
+        self.api.drive.root = self.remote_root
+        self.engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            Mock(),
+            crawl_mode="lazy",
+        )
+        self.engine._schedule_download = Mock()
+        self.mirror.ensure_dir("/")
+        self.fs = ICloudFS.__new__(ICloudFS)
+        self.fs.logger = Mock()
+        self.fs.api = self.api
+        self.fs.mirror = self.mirror
+        self.fs.state = self.state
+        self.fs.sync_engine = self.engine
+
+    def tearDown(self):
+        self.engine.shutdown()
+        shutil.rmtree(self.root)
+
+    def test_readdir_lists_the_folder_on_first_access(self):
+        self.remote_root.children = [FakeNode("notes.txt", size=3)]
+
+        names = [entry.name for entry in self.fs.readdir("/", 0)]
+
+        self.assertIn("notes.txt", names)
+
+    def test_getattr_falls_back_to_listing_the_parent(self):
+        self.remote_root.children = [FakeNode("notes.txt", size=3)]
+
+        attrs = self.fs.getattr("/notes.txt")
+
+        self.assertNotEqual(attrs, -errno.ENOENT)
+        self.assertEqual(attrs.st_size, 3)
+
+    def test_getattr_still_reports_enoent_for_a_missing_path(self):
+        self.assertEqual(self.fs.getattr("/nope.txt"), -errno.ENOENT)
+
+    def test_full_crawl_mode_does_not_list_on_readdir(self):
+        self.engine.crawl_mode = "full"
+        self.remote_root.get_children = Mock(return_value=[])
+
+        list(self.fs.readdir("/", 0))
+
+        self.remote_root.get_children.assert_not_called()
 
 
 if __name__ == "__main__":

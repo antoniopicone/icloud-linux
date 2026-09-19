@@ -101,6 +101,15 @@ load_env_if_present() {
   fi
 }
 
+config_cache_dir() {
+  local configured=""
+  if [[ -f "$CONFIG_FILE" ]]; then
+    configured="$(sed -nE 's/^[[:space:]]*cache_dir[[:space:]]*:[[:space:]]*"?([^"#]*[^"# ])"?[[:space:]]*$/\1/p' "$CONFIG_FILE" | head -n1)"
+  fi
+  configured="${configured:-$CACHE_DIR}"
+  echo "${configured/#\~/$HOME}"
+}
+
 cleanup_mountpoint() {
   load_env_if_present
   local mount_dir="${1:-${ICLOUD_MOUNT:-$MOUNT_DIR_DEFAULT}}"
@@ -165,6 +174,7 @@ cmd_configure() {
 username: "$email"
 password: "$password"
 cache_dir: "$CACHE_DIR"
+crawl_mode: "lazy"
 warmup_mode: "background"
 conflict_mode: "copy"
 upload_interval_seconds: 30
@@ -225,6 +235,62 @@ cmd_clear_cache() {
   fi
 }
 
+NAUTILUS_EXT_DIR="$HOME/.local/share/nautilus-python/extensions"
+NAUTILUS_EXT_FILE="$NAUTILUS_EXT_DIR/icloud_status.py"
+
+restart_nautilus() {
+  if ! command -v nautilus >/dev/null 2>&1; then
+    return
+  fi
+  echo "Quitting Nautilus so it reloads its extensions (open windows will close)."
+  nautilus -q >/dev/null 2>&1 || true
+  echo "It starts again on the next file-manager window you open."
+}
+
+cmd_nautilus_install() {
+  if ! python3 -c "import gi; gi.require_version('Nautilus', '4.0')" >/dev/null 2>&1; then
+    echo "WARN: nautilus-python does not look available."
+    echo "      Debian/Ubuntu: sudo apt-get install python3-nautilus"
+    echo "      Fedora:        sudo dnf install nautilus-python"
+  fi
+  mkdir -p "$NAUTILUS_EXT_DIR"
+  cp "$REPO_DIR/nautilus/icloud_status.py" "$NAUTILUS_EXT_FILE"
+  echo "Installed $NAUTILUS_EXT_FILE"
+  restart_nautilus
+}
+
+cmd_nautilus_uninstall() {
+  rm -f "$NAUTILUS_EXT_FILE"
+  echo "Removed $NAUTILUS_EXT_FILE"
+  restart_nautilus
+}
+
+# GNOME's file indexer walks $HOME recursively and opens every file it finds.
+# On the mount that reads as a user opening every file, so it hydrates the
+# whole drive. driver.py writes the marker into the mirror on startup; this
+# command applies it without waiting for a restart and kicks the indexer so it
+# picks up the new rule instead of finishing the queue it already built.
+cmd_trackerignore() {
+  local cache_dir
+  cache_dir="$(config_cache_dir)"
+  local mirror_root="$cache_dir/mirror"
+  if [[ ! -d "$mirror_root" ]]; then
+    echo "Mirror not created yet: $mirror_root"
+    echo "Start the service once ('./icloudctl start'), then re-run this."
+    exit 1
+  fi
+  if [[ -f "$mirror_root/.trackerignore" ]]; then
+    echo "Already excluded from desktop search indexing: $mirror_root/.trackerignore"
+    return
+  fi
+  : > "$mirror_root/.trackerignore"
+  echo "Created $mirror_root/.trackerignore"
+  if pgrep -u "$USER" -f 'localsearch-3|tracker-miner-fs' >/dev/null 2>&1; then
+    pkill -u "$USER" -f 'localsearch-3|tracker-miner-fs' >/dev/null 2>&1 || true
+    echo "Restarted the Tracker/localsearch indexer (D-Bus activated; it comes back on demand)."
+  fi
+}
+
 cmd_uninstall() {
   local purge="${1:-}"
   systemctl --user stop icloud.service >/dev/null 2>&1 || true
@@ -234,7 +300,7 @@ cmd_uninstall() {
   systemctl --user reset-failed >/dev/null 2>&1 || true
 
   if [[ "$purge" == "--purge" ]]; then
-    rm -f "$CONFIG_FILE" "$ENV_FILE"
+    rm -f "$CONFIG_FILE" "$ENV_FILE" "$NAUTILUS_EXT_FILE"
     rm -rf "$CONFIG_DIR/cookies" "$CACHE_DIR" "$STATE_DIR"
     echo "Uninstalled and purged local config/cache/session data."
   else
@@ -261,6 +327,19 @@ cmd_doctor() {
     echo "MISSING: $ENV_FILE"
   fi
   systemctl --user --no-pager status icloud.service >/dev/null 2>&1 && echo "OK: service exists" || echo "WARN: service not initialized"
+
+  local mirror_root
+  mirror_root="$(config_cache_dir)/mirror"
+  if [[ -d "$mirror_root" ]]; then
+    if [[ -f "$mirror_root/.trackerignore" ]]; then
+      echo "OK: excluded from desktop search indexing"
+    else
+      echo "WARN: no .trackerignore in $mirror_root — the GNOME indexer may hydrate the whole drive"
+      echo "      Fix with: ./icloudctl trackerignore"
+    fi
+  fi
+  [[ -f "$NAUTILUS_EXT_FILE" ]] && echo "OK: Nautilus status extension installed" \
+    || echo "INFO: Nautilus status extension not installed (./icloudctl nautilus-install)"
 }
 
 cmd_quickstart() {
@@ -298,8 +377,14 @@ Commands:
                            (sends SIGUSR1, waits for completion).  Useful when
                            auto_sync: false is set in config.yaml.
   clear-cache              Remove local mirror/state and rebuild on next start
+  nautilus-install         Install the Nautilus sidebar status extension
+  nautilus-uninstall       Remove the Nautilus status extension
+  trackerignore            Exclude the mount from GNOME's search indexer, which
+                           would otherwise walk the whole drive and hydrate it
   start|stop|restart       Service control
-  refresh                  Trigger a remote metadata crawl now
+  refresh                  Refresh remote metadata now.  With crawl_mode: lazy
+                           that re-lists every folder already browsed; with
+                           crawl_mode: full it is a complete recursive crawl
   status                   Show service status
   logs                     Tail service logs
   doctor                   Check local setup health
@@ -318,6 +403,9 @@ main() {
     hydrate) cmd_hydrate "$@" ;;
     sync) cmd_sync "$@" ;;
     clear-cache) cmd_clear_cache ;;
+    nautilus-install) cmd_nautilus_install ;;
+    nautilus-uninstall) cmd_nautilus_uninstall ;;
+    trackerignore) cmd_trackerignore ;;
     start) cmd_start ;;
     stop) cmd_stop ;;
     restart) cmd_restart ;;

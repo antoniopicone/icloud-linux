@@ -1,4 +1,4 @@
-.PHONY: help quickstart init configure auth start stop restart refresh status logs doctor uninstall
+.PHONY: help quickstart init configure auth start stop restart refresh status logs doctor uninstall nautilus-install nautilus-uninstall trackerignore test
 
 help:
 	@echo "Targets:"
@@ -7,6 +7,9 @@ help:
 	@echo "  make configure    # write credentials config"
 	@echo "  make auth         # run interactive 2FA bootstrap"
 	@echo "  make start|stop|restart|refresh|status|logs|doctor|uninstall"
+	@echo "  make nautilus-install  # Nautilus sidebar status extension"
+	@echo "  make trackerignore     # keep GNOME's indexer out of the mount"
+	@echo "  make test              # run the unit tests"
 
 quickstart:
 	./icloudctl quickstart
@@ -43,3 +46,15 @@ doctor:
 
 uninstall:
 	./icloudctl uninstall
+
+nautilus-install:
+	./icloudctl nautilus-install
+
+nautilus-uninstall:
+	./icloudctl nautilus-uninstall
+
+trackerignore:
+	./icloudctl trackerignore
+
+test:
+	.venv/bin/python -m unittest discover -p 'test_*.py'

@@ -42,6 +42,9 @@ fuse.fuse_python_api = (0, 2)
 ROOT_DRIVEWSID = "FOLDER::com.apple.CloudDocs::root"
 DIRECTORY_NODE_TYPES = {"folder", "app_library"}
 IO_CHUNK_SIZE = 1024 * 1024
+# Marker file honored by GNOME's Tracker/localsearch indexer; see
+# LocalMirror.ensure_tracker_ignore().
+TRACKER_IGNORE_MARKER = ".trackerignore"
 
 
 def normalize_icloud_path(path):
@@ -180,6 +183,11 @@ class SyncState:
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS folder_listings (
+                    path TEXT PRIMARY KEY,
+                    remote_drivewsid TEXT,
+                    listed_at INTEGER NOT NULL
+                );
                 """
             )
             columns = {
@@ -189,6 +197,59 @@ class SyncState:
             if "remote_shareid" not in columns:
                 self.conn.execute("ALTER TABLE entries ADD COLUMN remote_shareid TEXT")
             self.conn.commit()
+
+    # --- On-demand directory listing (crawl_mode: lazy) --------------------
+    # folder_listings records, for every folder the user has actually browsed,
+    # when it was last enumerated from iCloud. It is a separate table rather
+    # than extra columns on `entries` because the root "/" is never itself a
+    # row in `entries` (getattr/readdir special-case it), so here it can have
+    # a row of its own without another special case.
+
+    def get_folder_listing(self, path):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM folder_listings WHERE path = ?",
+                (path,),
+            ).fetchone()
+        return row_to_dict(row)
+
+    def mark_folder_listed(self, path, remote_drivewsid=None):
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO folder_listings (path, remote_drivewsid, listed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    remote_drivewsid = excluded.remote_drivewsid,
+                    listed_at = excluded.listed_at
+                """,
+                (path, remote_drivewsid, int(time.time())),
+            )
+            self.conn.commit()
+
+    def list_children(self, parent_path):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM entries WHERE parent_path = ? ORDER BY path",
+                (parent_path,),
+            ).fetchall()
+        return [self._decode_entry(dict(row)) for row in rows]
+
+    def list_listed_folders(self):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT path FROM folder_listings ORDER BY listed_at ASC"
+            ).fetchall()
+        return [row["path"] for row in rows]
+
+    def list_stale_folder_listings(self, ttl_seconds):
+        cutoff = int(time.time()) - int(ttl_seconds)
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT path FROM folder_listings WHERE listed_at < ? ORDER BY listed_at ASC",
+                (cutoff,),
+            ).fetchall()
+        return [row["path"] for row in rows]
 
     def upsert_entry(self, entry):
         payload = {
@@ -396,6 +457,19 @@ class SyncState:
                 "DELETE FROM pending_ops WHERE path = ? OR path LIKE ? OR target_path = ? OR target_path LIKE ?",
                 (path, prefix + "%", path, prefix + "%"),
             )
+            self.forget_folder_listings(path)
+            self.conn.commit()
+
+    def forget_folder_listings(self, path):
+        """Drop the on-demand listing markers for a folder and everything under
+        it, so a path that reappears later is enumerated again instead of being
+        treated as freshly listed."""
+        prefix = path.rstrip("/") + "/"
+        with self.lock:
+            self.conn.execute(
+                "DELETE FROM folder_listings WHERE path = ? OR path LIKE ?",
+                (path, prefix + "%"),
+            )
             self.conn.commit()
 
     def rename_tree(self, oldpath, newpath, root_dirty=True, update_synced=False):
@@ -464,6 +538,10 @@ class SyncState:
                     len(prefix) + 1,
                 ),
             )
+            # The moved subtree keeps its remote ids, but its listing markers
+            # are keyed by path: drop them so the new location is enumerated
+            # on its first readdir instead of looking already listed.
+            self.forget_folder_listings(oldpath)
             self.conn.commit()
 
     def mark_synced_subtree(self, path):
@@ -595,6 +673,33 @@ class LocalMirror:
         self.tmp_dir = os.path.join(cache_dir, "tmp")
         os.makedirs(self.root, exist_ok=True)
         os.makedirs(self.tmp_dir, exist_ok=True)
+        self.ensure_tracker_ignore()
+
+    def ensure_tracker_ignore(self):
+        """Create the marker that keeps desktop search indexers out of the mount.
+
+        GNOME's file indexer (tracker-miner-fs / localsearch) indexes $HOME
+        recursively by default, and the usual mount point lives under $HOME.
+        The indexer walks the whole tree and opens every file to extract its
+        contents — to a FUSE filesystem that is indistinguishable from a user
+        browsing every folder, so it hydrates the entire drive within seconds
+        of mounting and defeats on-demand listing entirely.
+
+        Tracker skips any directory containing one of its
+        `ignored-directories-with-content` markers, ".trackerignore" among
+        them. It is written straight into the mirror rather than through the
+        mount so it never looks like a user-created file and never gets queued
+        for upload to iCloud.
+        """
+        marker = os.path.join(self.root, TRACKER_IGNORE_MARKER)
+        try:
+            if not os.path.exists(marker):
+                with open(marker, "wb"):
+                    pass
+        except OSError:
+            # Best effort: an unwritable cache dir is reported elsewhere, and a
+            # missing marker only costs extra indexing, never correctness.
+            pass
 
     def local_path(self, path):
         normalized = os.path.normpath(path)
@@ -739,11 +844,18 @@ class ICloudSyncEngine:
         sync_paths=None,
         exclude_paths=None,
         auto_sync=True,
+        crawl_mode="lazy",
     ):
         self.api = api
         self.mirror = mirror
         self.state = state
         self.logger = logger
+        # "lazy" (default): no recursive crawl at startup; each folder is
+        #   enumerated from iCloud the first time it is actually read, the way
+        #   Finder and Files.app behave on macOS.
+        # "full": the historical behavior — a complete recursive crawl at
+        #   startup and on every periodic refresh.
+        self.crawl_mode = crawl_mode if crawl_mode in {"lazy", "full"} else "lazy"
         self.warmup_mode = warmup_mode if warmup_mode in {"background", "lazy"} else "background"
         self.conflict_mode = conflict_mode if conflict_mode in {"copy"} else "copy"
         self.upload_interval_seconds = upload_interval_seconds
@@ -787,13 +899,29 @@ class ICloudSyncEngine:
         if self.has_persistent_cache():
             self.logger.info("Using persistent local cache from %s", self.mirror.root)
             self._reconcile_persistent_cache()
-            if self.warmup_mode == "background":
+            if self.crawl_mode == "full" and self.warmup_mode == "background":
                 self._schedule_all_unhydrated()
-        else:
+        elif self.crawl_mode == "full":
             self.logger.info("Persistent cache not initialized yet; performing first remote crawl")
             self.initial_scan()
             if self.warmup_mode == "background":
                 self._schedule_all_unhydrated()
+        else:
+            # crawl_mode == "lazy": nothing is fetched from iCloud here. The
+            # root only has to exist as a real directory in the mirror for FUSE
+            # to have something to mount over; its contents are enumerated by
+            # the first readdir("/") through list_directory().
+            self.mirror.ensure_dir("/")
+            self.logger.info(
+                "crawl_mode=lazy: skipping the startup crawl; folders are listed "
+                "from iCloud the first time they are opened"
+            )
+        if self.crawl_mode == "lazy" and self.warmup_mode == "background":
+            self.logger.info(
+                "crawl_mode=lazy overrides warmup_mode=background: file contents are "
+                "downloaded when a file is opened, not ahead of time. Set "
+                "crawl_mode: full to warm the whole drive up in the background."
+            )
         if self.auto_sync:
             self._start_background_threads()
         else:
@@ -1072,7 +1200,7 @@ class ICloudSyncEngine:
             self.mirror.remove_tree(entry["path"])
             self.state.remove_subtree(entry["path"])
 
-    def _materialize_remote_entry(self, meta):
+    def _materialize_remote_entry(self, meta, schedule_download=True):
         local_path = meta["path"]
         self._log_sync(
             "remote-materialize",
@@ -1096,10 +1224,15 @@ class ICloudSyncEngine:
                 "synced_path": local_path,
             }
         )
-        if meta["type"] == "file" and not hydrated:
+        # list_directory() passes schedule_download=False: opening a folder
+        # means the user asked for its listing, not for its contents, so each
+        # file stays a placeholder (right icon, right size) until it is really
+        # opened. The default stays True for the crawl_mode: full path, where
+        # warming every file up in the background is the intended behavior.
+        if meta["type"] == "file" and not hydrated and schedule_download:
             self._schedule_download(local_path)
 
-    def _refresh_clean_entry(self, entry, meta):
+    def _refresh_clean_entry(self, entry, meta, schedule_download=True):
         oldpath = entry["path"]
         newpath = meta["path"]
         if oldpath != newpath and self.mirror.exists(oldpath):
@@ -1314,17 +1447,135 @@ class ICloudSyncEngine:
         except Exception as exc:
             self.logger.error("Remote refresh failed (%s): %s", reason, exc)
 
+    def _run_lazy_refresh(self, reason, force=False):
+        """Re-enumerate the folders the user has already browsed.
+
+        In lazy mode there is no "whole tree" to rescan: only folders with a
+        row in folder_listings have ever been shown, so only those are worth
+        refreshing. Each one is a single targeted request through the same
+        list_directory() that readdir() uses. `force` covers the on-demand
+        path ('icloudctl sync'/'refresh'), where the user wants everything
+        known re-checked now rather than only what has gone stale.
+        """
+        if force:
+            paths = self.state.list_listed_folders()
+        else:
+            paths = self.state.list_stale_folder_listings(self.remote_refresh_interval_seconds)
+        if not paths:
+            self._log_sync("lazy-refresh-nothing-stale", reason=reason)
+            return
+        self._log_sync("lazy-refresh-start", reason=reason, folders=len(paths))
+        for path in paths:
+            if self.stop_event.is_set():
+                break
+            try:
+                self.list_directory(path, force=True)
+            except Exception as exc:
+                self.logger.error("Lazy refresh failed for %s: %s", path, exc)
+        self._log_sync("lazy-refresh-complete", reason=reason)
+
+    def run_refresh(self, reason, force=False):
+        """Refresh remote metadata using whichever strategy crawl_mode selects."""
+        if self.crawl_mode == "full":
+            self._run_remote_refresh(reason)
+        else:
+            self._run_lazy_refresh(reason, force=force)
+
     def _refresh_loop(self):
-        immediate = self.has_persistent_cache()
-        if immediate:
-            self.logger.info("Starting background remote refresh from persistent cache")
-            self._run_remote_refresh("startup")
+        if self.crawl_mode == "full":
+            immediate = self.has_persistent_cache()
+            if immediate:
+                self.logger.info("Starting background remote refresh from persistent cache")
+                self._run_remote_refresh("startup")
         while not self.stop_event.is_set():
             manual = self.refresh_now_event.wait(self.remote_refresh_interval_seconds)
             self.refresh_now_event.clear()
             if self.stop_event.is_set():
                 break
-            self._run_remote_refresh("manual" if manual else "scheduled")
+            self.run_refresh("manual" if manual else "scheduled", force=manual)
+
+    def list_directory(self, path, force=False):
+        """List the direct children of `path`, asking iCloud at most once per
+        folder and never recursing.
+
+        Called from readdir() at the moment the user (Nautilus, ls, a file
+        dialog) actually opens that folder. A failed request never raises:
+        readdir() then shows whatever the local mirror already holds.
+        """
+        lock = self._path_lock(path)
+        with lock:
+            listing = self.state.get_folder_listing(path)
+            now = int(time.time())
+            if (
+                not force
+                and listing
+                and now - listing["listed_at"] < self.remote_refresh_interval_seconds
+            ):
+                return  # still fresh; no request needed
+
+            if path == "/":
+                node = self.api.drive.root
+                drivewsid = None
+            else:
+                entry = self.state.get_entry(path)
+                if not entry or not self._is_directory_type(entry["type"]):
+                    # Not a known folder (never listed, or a file): nothing to
+                    # enumerate, and no marker either — the path may become
+                    # listable once its parent has been read.
+                    return
+                drivewsid = entry["remote_drivewsid"]
+                if not drivewsid:
+                    # Created locally and not yet pushed to iCloud: there is
+                    # nothing remote to list, but the folder is legitimately
+                    # up to date, so record the listing.
+                    self.state.mark_folder_listed(path)
+                    return
+                # DriveNode needs the DriveService connection (api.drive), not
+                # the PyiCloudService. Given only {"drivewsid": ...} it issues a
+                # single retrieveItemDetailsInFolders call for that id, so no
+                # walk down from the root is required.
+                node = DriveNode(self.api.drive, {"drivewsid": drivewsid})
+
+            self._log_sync("list-directory-start", path=path)
+            try:
+                children = node.get_children(force=True)
+            except Exception as exc:
+                self.logger.error("Could not list %s from iCloud: %s", path, exc)
+                return
+
+            seen_ids = set()
+            for child in children:
+                child_path = ("/" + child.name) if path == "/" else (path.rstrip("/") + "/" + child.name)
+                meta = self._node_to_meta(child, child_path)
+                seen_ids.add(meta["remote_drivewsid"])
+                existing = self.state.get_entry_by_remote_id(meta["remote_drivewsid"])
+                if existing and existing["dirty"] and self._entry_conflicts(existing, meta):
+                    self._resolve_conflict(existing)
+                    existing = None
+                if existing is None:
+                    path_entry = self.state.get_entry(meta["path"])
+                    if path_entry and path_entry["dirty"]:
+                        self._resolve_conflict(path_entry)
+                    self._materialize_remote_entry(meta, schedule_download=False)
+                elif not existing["dirty"]:
+                    self._refresh_clean_entry(existing, meta, schedule_download=False)
+
+            # Local sweep restricted to the direct children of this folder.
+            # Unlike the sweep in _apply_remote_snapshot — which spans the whole
+            # tree and is therefore only safe once a full crawl has finished —
+            # this one compares against state.list_children(path) alone, so it
+            # can never mistake a branch nobody has visited yet for something
+            # deleted remotely: it simply does not look at it.
+            for child_entry in self.state.list_children(path):
+                remote_id = child_entry["remote_drivewsid"]
+                if not remote_id or remote_id in seen_ids or child_entry["dirty"]:
+                    continue
+                self.logger.info("Removing entry that disappeared remotely: %s", child_entry["path"])
+                self.mirror.remove_tree(child_entry["path"])
+                self.state.remove_subtree(child_entry["path"])
+
+            self.state.mark_folder_listed(path, drivewsid)
+            self._log_sync("list-directory-complete", path=path, entries=len(children))
 
     def sync_dirty_entries(self):
         dirty_entries = [
@@ -1729,6 +1980,7 @@ class ICloudFS(Fuse):
         sync_paths=None,
         exclude_paths=None,
         auto_sync=True,
+        crawl_mode="lazy",
     ):
         self.mirror = LocalMirror(cache_dir)
         state_path = os.path.join(cache_dir, "state.sqlite3")
@@ -1752,10 +2004,44 @@ class ICloudFS(Fuse):
             sync_paths=sync_paths,
             exclude_paths=exclude_paths,
             auto_sync=auto_sync,
+            crawl_mode=crawl_mode,
         )
         self.sync_engine.start()
 
+    def _lazy_listing_enabled(self):
+        """Return True when readdir/getattr should enumerate folders on demand."""
+        return (
+            self.sync_engine is not None
+            and self.sync_engine.crawl_mode == "lazy"
+            and self._is_authenticated()
+        )
+
     def getattr(self, path):
+        attrs = self._stat_known_path(path)
+        if attrs is not None:
+            return attrs
+
+        # The path is unknown locally. Under crawl_mode: lazy that is expected
+        # for a direct access whose parent has never been listed (xdg-open, a
+        # path typed by hand, a recent-files entry). Enumerate the parent once
+        # before giving up, so direct access behaves like browsing there first.
+        if self._lazy_listing_enabled():
+            parent = os.path.dirname(path) or "/"
+            try:
+                self.sync_engine.list_directory(parent)
+            except Exception as exc:
+                self.logger.error(
+                    "list_directory (getattr fallback) failed for %s: %s", parent, exc
+                )
+            else:
+                attrs = self._stat_known_path(path)
+                if attrs is not None:
+                    return attrs
+
+        return -errno.ENOENT
+
+    def _stat_known_path(self, path):
+        """Return a Stat for a path already known locally, else None."""
         now = int(time.time())
         entry = self.state.get_entry(path) if self.state else None
         attrs = Stat()
@@ -1796,9 +2082,17 @@ class ICloudFS(Fuse):
             attrs.st_gid = os.getgid()
             return attrs
 
-        return -errno.ENOENT
+        return None
 
     def readdir(self, path, offset):
+        if self._lazy_listing_enabled():
+            try:
+                self.sync_engine.list_directory(path)
+            except Exception as exc:
+                # A network error never blocks the listing: whatever the local
+                # mirror already holds is still shown.
+                self.logger.error("list_directory failed for %s: %s", path, exc)
+
         if not self.mirror.exists(path) or not self.mirror.is_dir(path):
             return -errno.ENOENT
 
@@ -2209,6 +2503,11 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     sync_paths = config.get("sync_paths", None)      # list of iCloud paths to hydrate, None=all
     exclude_paths = config.get("exclude_paths", None) # deny-list applied before sync_paths
     auto_sync = bool(config.get("auto_sync", True))   # False = manual sync only via icloudctl sync
+    # "lazy" (default): no recursive crawl; every folder is listed from iCloud
+    #   the first time it is opened, the way Finder/Files.app behave on macOS.
+    # "full": the historical behavior — complete crawl at startup and on every
+    #   periodic refresh.
+    crawl_mode = config.get("crawl_mode", "lazy")
 
     # When running under systemd (no TTY) we never want a failed auth to crash
     # the process — that would trigger Restart=on-failure and hammer Apple's
@@ -2227,10 +2526,12 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         raise SystemExit(0)
 
     # SIGUSR1 — on-demand sync/refresh trigger (used by 'icloudctl sync' and 'icloudctl refresh').
-    # Queues a one-shot remote crawl in a background thread so the signal
+    # Queues a one-shot remote refresh in a background thread so the signal
     # handler returns immediately and FUSE keeps serving requests.
     # If sync_engine is not ready yet (still reconciling), queues it to run
-    # once the engine is available.
+    # once the engine is available.  With crawl_mode: full that is a complete
+    # recursive crawl; with crawl_mode: lazy it re-lists every folder already
+    # browsed, which is the whole of what lazy mode has ever shown.
     def handle_sigusr1(signum, frame):
         def _one_shot():
             # Wait up to 120s for the sync engine to be ready after startup
@@ -2240,12 +2541,15 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
             if fs.sync_engine is None:
                 logger.warning("SIGUSR1: sync engine not available (unauthenticated or startup failed)")
                 return
-            logger.info("SIGUSR1: starting on-demand remote metadata crawl")
+            logger.info("SIGUSR1: starting on-demand remote metadata refresh")
             try:
-                fs.sync_engine.initial_scan()
-                logger.info("SIGUSR1: on-demand remote metadata crawl complete")
+                if fs.sync_engine.crawl_mode == "full":
+                    fs.sync_engine.initial_scan()
+                else:
+                    fs.sync_engine.run_refresh("signal", force=True)
+                logger.info("SIGUSR1: on-demand remote metadata refresh complete")
             except Exception as exc:
-                logger.error("SIGUSR1: on-demand remote metadata crawl failed: %s", exc)
+                logger.error("SIGUSR1: on-demand remote metadata refresh failed: %s", exc)
             finally:
                 # Write completion marker so icloudctl sync can detect done.
                 state_dir = os.path.expanduser("~/.local/state/icloud-linux")
@@ -2272,6 +2576,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         sync_paths=sync_paths,
         exclude_paths=exclude_paths,
         auto_sync=auto_sync,
+        crawl_mode=crawl_mode,
     )
 
     try:

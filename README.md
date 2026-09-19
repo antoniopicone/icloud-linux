@@ -20,7 +20,7 @@ In practice, that means `find`, editors, shells, and normal file browsing work a
 
 There are three main pieces:
 
-- Metadata crawl: the first run scans your iCloud Drive and builds a local index.
+- Metadata listing: by default each folder is listed from iCloud the first time it is opened (`crawl_mode: lazy`), the way Finder and Files.app behave on macOS. With `crawl_mode: full` the first run instead scans the whole drive and builds a complete index up front.
 - Hydration: file contents are downloaded into the local cache — either on demand when a file is opened (lazy mode) or proactively in the background (background mode).
 - Sync engine: local edits upload and remote changes are refreshed either automatically on a timer or on demand via `icloudctl sync`.
 
@@ -38,6 +38,7 @@ Important behavior:
 This project is for people who want:
 
 - a normal folder they can browse on Linux
+- browsing that behaves like Finder on macOS: folders listed as you open them, files downloaded as you open them
 - Apple ID + 2FA support
 - a persistent local cache
 - control over which folders are hydrated vs stub-only
@@ -59,12 +60,16 @@ You need:
 ```bash
 sudo apt-get update
 sudo apt-get install -y fuse libfuse-dev pkg-config python3-venv
+# optional, for the Nautilus status extension:
+sudo apt-get install -y python3-nautilus
 ```
 
 ### Fedora
 
 ```bash
 sudo dnf install python3-devel fuse fuse-libs fuse-devel gcc make
+# optional, for the Nautilus status extension:
+sudo dnf install nautilus-python
 ```
 
 ## Fast Setup
@@ -140,6 +145,9 @@ Use `--debug` to see Apple's reported auth mode and diagnose delivery issues:
 ./icloudctl hydrate [--dry-run] [--verbose]
 ./icloudctl sync [--timeout SECONDS] [--quiet]
 ./icloudctl clear-cache
+./icloudctl nautilus-install
+./icloudctl nautilus-uninstall
+./icloudctl trackerignore
 ./icloudctl uninstall
 ```
 
@@ -148,20 +156,29 @@ What they do:
 - `start`: starts the background user service
 - `stop`: stops the service and unmounts the folder
 - `restart`: restarts the service cleanly
-- `refresh`: asks the running service to crawl remote iCloud Drive metadata now
+- `refresh`: asks the running service to refresh remote metadata now. Under `crawl_mode: lazy` that re-lists every folder you have already browsed; under `crawl_mode: full` it is a complete recursive crawl
 - `status`: shows whether the service is running
 - `logs`: tails the service logs
 - `doctor`: checks common setup issues
-- `hydrate`: blocks until all eligible files (per `sync_paths` / `exclude_paths`) are fully downloaded locally. Use this before copying files to ensure nothing triggers a mid-copy download. `--dry-run` shows what would be downloaded without actually downloading.
+- `hydrate`: blocks until all eligible files (per `sync_paths` / `exclude_paths`) are fully downloaded locally. Use this before copying files to ensure nothing triggers a mid-copy download. `--dry-run` shows what would be downloaded without actually downloading. Under `crawl_mode: lazy` it can only hydrate what has been listed so far — see below
 - `sync`: triggers an on-demand remote metadata sync in the running driver (sends SIGUSR1, waits for completion). Useful when `auto_sync: false` is set.
 - `clear-cache`: deletes the local mirror and sync database, then rebuilds them on next start
+- `nautilus-install`: installs the Nautilus sidebar status extension (see below)
+- `nautilus-uninstall`: removes that extension
+- `trackerignore`: excludes the mount from GNOME's search indexer (see below)
 - `uninstall`: removes the generated user service
 
 ## What Happens After You Start It
 
-On the first run:
+On the first run, with the default `crawl_mode: lazy`:
 
-- the service crawls your iCloud Drive metadata
+- the service mounts the folder right away — there is no startup crawl to wait for
+- the first time you open a folder, its direct children are listed from iCloud
+- file contents download when a file is actually opened
+
+On the first run with `crawl_mode: full`:
+
+- the service crawls your iCloud Drive metadata before mounting
 - it mounts the folder
 - if `warmup_mode: background`, it starts downloading file contents into the local cache
 - if `warmup_mode: lazy`, file contents download only when each file is first opened
@@ -171,6 +188,65 @@ On later runs:
 - it reuses the cache stored on disk
 - if `auto_sync: true`, it refreshes remote metadata and uploads local changes on a timer
 - if `auto_sync: false`, it mounts immediately with no background polling; run `icloudctl sync` on demand
+
+## On-Demand Listing vs Full Crawl
+
+**`crawl_mode: lazy`** (default) — nothing is enumerated up front. A folder is
+listed from iCloud the first time something reads it, through the filesystem's
+own `readdir()`/`getattr()`:
+
+- `ls ~/iCloud` lists only the direct children of the root
+- `cd ~/iCloud/Documents` lists only the direct children of that folder
+- opening a file downloads that file, and only that file
+
+Listing a folder never downloads the files inside it — they stay placeholders
+with the right name, size, and timestamp until something opens them. Each
+folder is re-listed at most once per `remote_refresh_interval_seconds`, so
+browsing back and forth costs nothing. This is what makes the mount usable a
+few seconds after `icloudctl start` even on a large drive.
+
+**`crawl_mode: full`** — the historical behavior: a complete recursive crawl
+before the first mount and on every periodic refresh. Choose it when you want
+the whole index available without browsing for it, for example to run
+`icloudctl hydrate` over folders you never open by hand, or to search the mount
+with `find` without walking it first.
+
+Under `crawl_mode: lazy`, `warmup_mode` has no effect: files are downloaded
+when they are opened, never ahead of time.
+
+### Keep The Desktop Indexer Out Of The Mount
+
+GNOME's file indexer (`tracker-miner-fs` / `localsearch`) indexes `$HOME`
+recursively by default, and the mount point normally lives under `$HOME`. The
+indexer walks the whole tree and opens every file to extract its contents — to
+a FUSE filesystem that is indistinguishable from a user browsing every folder
+and opening every file. Left alone it hydrates the entire drive within seconds
+of mounting and defeats on-demand listing entirely.
+
+The driver writes a `.trackerignore` marker into the mirror at startup, which
+makes Tracker skip the whole subtree. To apply it to an already-running setup
+without restarting, and to kick the indexer so it picks up the new rule:
+
+```bash
+./icloudctl trackerignore
+```
+
+`./icloudctl doctor` reports whether the marker is in place.
+
+## Nautilus Status Extension
+
+`icloudctl nautilus-install` installs a small Nautilus extension that shows what
+the mount is doing right now, since with on-demand listing the work happens
+while you browse:
+
+- the sidebar bookmark reads `iCloud (listing: Documents)` while a folder is
+  being enumerated, `iCloud (downloading: invoice.pdf)` while a file is being
+  fetched, and plain `iCloud` when idle
+- a context-menu item, "iCloud sync status…", reports the last known activity
+
+It reads the driver's log; it never talks to iCloud itself. It requires
+nautilus-python (`python3-nautilus` on Debian/Ubuntu, `nautilus-python` on
+Fedora) and creates the sidebar bookmark if you do not already have one.
 
 ## Controlling the Synchronization Boundary
 
@@ -225,6 +301,17 @@ icloudctl hydrate       # download file contents for all eligible paths
 # now copy from mirror: ~/.cache/icloud-linux/mirror/Downloads/
 ```
 
+`icloudctl hydrate` works from the local index, so under `crawl_mode: lazy` it
+only sees folders that have already been listed. To hydrate a tree you have
+not browsed, walk it first — which is what makes the driver list it:
+
+```bash
+find ~/iCloud/Downloads -type d >/dev/null   # lists every folder on the way
+icloudctl hydrate
+```
+
+For a whole-drive hydrate, set `crawl_mode: full` instead.
+
 ## Copying Files to Another Location
 
 Once files are hydrated, copy from the local mirror rather than from the FUSE mount:
@@ -245,6 +332,8 @@ The project keeps its local state here:
 - User service: `~/.config/systemd/user/icloud.service`
 - Local cache root: `~/.cache/icloud-linux`
 - Local mirror: `~/.cache/icloud-linux/mirror`
+- Desktop-indexer opt-out marker: `~/.cache/icloud-linux/mirror/.trackerignore`
+- Nautilus extension: `~/.local/share/nautilus-python/extensions/icloud_status.py`
 - Sync state database: `~/.cache/icloud-linux/state.sqlite3`
 - Logs: `~/.local/state/icloud-linux/icloud.log`
 - On-demand sync marker: `~/.local/state/icloud-linux/sync_done`
@@ -293,6 +382,17 @@ When running under systemd (no TTY), a failed auth parks the service in unauthen
 ./icloudctl restart
 ```
 
+### The mount looks empty, or everything downloads at once
+
+Under `crawl_mode: lazy` a folder is listed the moment you open it, so an empty
+`~/iCloud` usually means the listing request failed. Check `./icloudctl logs`
+for `list-directory-start` without a matching `list-directory-complete`, and
+confirm the session is still valid with `./icloudctl auth`.
+
+If instead the whole drive starts downloading by itself shortly after mounting,
+the desktop search indexer is walking the mount. Run `./icloudctl trackerignore`
+and check `./icloudctl doctor`.
+
 ### I want to rebuild everything locally
 
 Run:
@@ -329,6 +429,7 @@ This reports how many files are already local vs need downloading, without downl
 
 ## Notes
 
+- Under `crawl_mode: lazy` the sweep that removes entries deleted on iCloud is restricted to the direct children of the folder being listed, so a branch nobody has visited yet is never mistaken for something deleted remotely.
 - Warmup downloads are intentionally conservative because iCloud file downloads are sensitive to aggressive parallelism.
 - The generated systemd unit is created by `./icloudctl`; the repo does not rely on checked-in service files anymore.
 - This project currently targets a user-level systemd service, not a system-wide root service.

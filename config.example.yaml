@@ -8,8 +8,19 @@ password: "your_apple_id_password"
 # Cache directory
 cache_dir: "~/.cache/icloud-linux"
 
+# Metadata crawl mode.
+# "lazy" (default) — no recursive crawl at all.  Each folder is listed from
+#                    iCloud the first time it is opened, the way Finder and
+#                    Files.app behave on macOS.  The mount comes up in seconds
+#                    even on a large drive.
+# "full"           — crawl the whole drive at startup and on every periodic
+#                    refresh.  Needed if you want the complete index up front
+#                    (e.g. 'icloudctl hydrate' over folders you never browse).
+crawl_mode: "lazy"
+
 # Cache warmup mode. "background" mounts after metadata sync and hydrates file contents
 # in the background. "lazy" downloads file contents only when first opened.
+# Ignored under crawl_mode: lazy, which never hydrates ahead of an actual open.
 warmup_mode: "background"
 
 # Conflict handling. "copy" preserves the local version as
