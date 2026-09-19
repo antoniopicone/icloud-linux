@@ -1,0 +1,23 @@
+[package]
+name = "icloud-installer"
+description = "GTK4 guided installer for icloud-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gtk4 = "0.11.4"
+icloud-api = { version = "0.2.0", path = "../icloud-api" }
+icloud-core = { version = "0.2.0", path = "../icloud-core" }
+secrecy = "0.10.3"
+serde_json = "1.0.151"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[[bin]]
+name = "icloud-installer"
+path = "src/main.rs"

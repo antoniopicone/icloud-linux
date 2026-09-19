@@ -1,78 +1,85 @@
-# Configuration file template (save as ~/.config/icloud-linux/config.yaml)
+# icloud-linux configuration. Copy to ~/.config/icloud-linux/config.yaml (mode 0600),
+# or let `icloudctl init` / `icloud-installer` create it. Every key is optional.
 ---
-# iCloud credentials
-# NOTE: pyicloud requires your Apple ID account password (not app-specific password)
+# Your Apple ID (email address or phone number).
 username: "your_apple_id@example.com"
-password: "your_apple_id_password"
 
-# Cache directory
+# OPTIONAL and best left out. With a stored password the service can renew an
+# expired session by itself (a trusted session needs no verification code).
+# Without it, an expired session means running `icloudctl auth` again, which
+# happens every few weeks. If you do store it, keep this file at mode 0600.
+#
+# password: "your_apple_id_password"
+
+# Where the local mirror and the sync database live.
 cache_dir: "~/.cache/icloud-linux"
 
-# Metadata crawl mode.
-# "lazy" (default) — no recursive crawl at all.  Each folder is listed from
-#                    iCloud the first time it is opened, the way Finder and
-#                    Files.app behave on macOS.  The mount comes up in seconds
-#                    even on a large drive.
-# "full"           — crawl the whole drive at startup and on every periodic
-#                    refresh.  Needed if you want the complete index up front
-#                    (e.g. 'icloudctl hydrate' over folders you never browse).
+# Where the iCloud session (cookies, tokens) is kept.
+cookie_dir: "~/.config/icloud-linux/cookies"
+
+# How iCloud Drive's contents are discovered.
+#   lazy (default) — nothing is crawled up front. A folder is listed from iCloud
+#                    the first time it is opened, the way Finder and Files.app
+#                    behave. The mount is up in seconds on any drive size, and
+#                    listing a folder never downloads the files inside it.
+#   full           — crawl the whole drive at startup and on every refresh. Needed
+#                    if you want everything indexed without browsing to it, e.g.
+#                    `icloudctl hydrate` over folders you never open.
 crawl_mode: "lazy"
 
-# Cache warmup mode. "background" mounts after metadata sync and hydrates file contents
-# in the background. "lazy" downloads file contents only when first opened.
-# Ignored under crawl_mode: lazy, which never hydrates ahead of an actual open.
+# When file contents are downloaded. Only matters with crawl_mode: full.
+#   background — fetch every eligible file in the background once it is known.
+#   lazy       — fetch a file only when it is opened.
+# With crawl_mode: lazy, files are always fetched when opened.
 warmup_mode: "background"
 
-# Conflict handling. "copy" preserves the local version as
-# "<name>.local-conflict-<timestamp>" if the same path changed remotely.
+# What happens when a path changed both here and on iCloud. "copy" keeps the
+# local version as "<name>.local-conflict-<timestamp>" and uploads it as a new
+# file next to the remote one. Nothing is overwritten silently.
 conflict_mode: "copy"
+
+# What deleting something on the mount does on iCloud.
+#   trash     (default) — moves it to "Recently Deleted", where it can be recovered.
+#   permanent           — removes it for good.
+delete_mode: "trash"
 
 # Push local changes to iCloud every N seconds.
 upload_interval_seconds: 30
 
-# Refresh remote metadata from iCloud every N seconds.
+# Re-check remote metadata every N seconds. In lazy mode this also bounds how
+# long a listed folder is trusted before it is listed again.
 remote_refresh_interval_seconds: 300
 
-# Number of warmup workers. The default keeps iCloud downloads serialized because
-# parallel reads appear to trigger server-side auth/throttling failures.
+# Download workers (1-16). iCloud downloads one file at a time per session, so
+# raising this only overlaps bookkeeping, not transfers.
 warmup_workers: 1
 
-# Persistent cookie/session directory used after one-time 2FA bootstrap
-cookie_dir: "~/.config/icloud-linux/cookies"
-
-# Paths to exclude from hydration and synchronization (deny-list, evaluated
-# before sync_paths). Matching paths will have stubs created but file contents
-# will never be downloaded, uploaded, renamed, or deleted through the mount.
-# Useful for carving large subdirectories out of a sync_path.
+# Synchronisation boundary.
 #
-# Example: hydrate all of /Downloads except the huge Michael Priority folder:
-#   sync_paths:
-#     - /Downloads
-#   exclude_paths:
-#     - /Downloads/Michael Priority
+# sync_paths is an allow-list. When set, only these paths have their contents
+# downloaded and may be created, written, renamed, moved or deleted through the
+# mount. Everything else is still listed (names, sizes) but cannot be read or
+# changed: reading fails with EACCES instead of returning empty data.
+# Leave it out or empty for no restriction.
 #
-# exclude_paths:
-#   - /Downloads/Michael Priority
-
-# Paths to include in the synchronization boundary (allow-list). When set,
-# only matching paths may be hydrated or mutated through the mount; attempts
-# to create, write, rename, or delete anything else fail with EACCES. Omit or
-# leave empty to retain unrestricted behavior.
+# exclude_paths is a deny-list, applied first: matching paths are never
+# downloaded or changed, even inside a sync_path. Useful for carving a huge
+# subfolder out of an allowed one.
 #
 # sync_paths:
 #   - /Downloads
+# exclude_paths:
+#   - /Downloads/Large Archive
 
-# Auto-sync mode.
-# true (default)  — background threads poll iCloud on upload_interval_seconds
-#                   and remote_refresh_interval_seconds schedules automatically.
-# false           — background threads are NOT started.  The driver mounts and
-#                   waits; run 'icloudctl sync' to pull the latest remote
-#                   changes on demand.  Good for low-churn libraries where
-#                   constant polling is wasteful.
+# true (default)  — background threads upload changes and refresh remote
+#                   metadata on the schedules above.
+# false           — no background polling. The mount serves what it has and
+#                   `icloudctl sync` pulls the latest changes on demand. Good for
+#                   drives that rarely change.
 auto_sync: true
 
-# FUSE options
+# FUSE mount options.
 fuse_options:
-  allow_other: false  # Set to true to allow other users to access the mount
-  ro: false           # Set to true for read-only access
-  nonempty: true      # Allow mounting over a non-empty directory
+  allow_other: false  # let other users see the mount (needs user_allow_other in /etc/fuse.conf)
+  ro: false           # mount read-only: every change is refused with EROFS
+  nonempty: true      # accepted for compatibility; libfuse 3 always allows this

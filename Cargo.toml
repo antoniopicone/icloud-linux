@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/icloud-api",
+    "crates/icloud-core",
+    "crates/icloudd",
+    "crates/icloudctl",
+    "crates/icloud-status",
+    "crates/icloud-installer",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/IsmaeelAkram/icloud-linux"
+
+# Memory safety is a stated goal of this port: no crate in the workspace may
+# contain `unsafe`. System calls go through `rustix`, FFI through the safe
+# wrappers of `fuser` and `gtk4`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints that cost more readability than they buy here.
+module_name_repetitions = "allow"
+wildcard_imports = "allow"      # engine submodules share their parent's scope on purpose
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+# Style lints whose "fix" would make the code less readable here.
+unused_self = "allow"           # methods kept as methods for a uniform call style
+struct_field_names = "allow"
+many_single_char_names = "allow"  # the SRP maths follows the RFC's letters
+needless_pass_by_value = "allow"
+items_after_statements = "allow"
+assigning_clones = "allow"
+ref_option = "allow"
+return_self_not_must_use = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

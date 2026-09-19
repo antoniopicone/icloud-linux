@@ -1,0 +1,19 @@
+[package]
+name = "icloud-status"
+description = "Shows what icloud-linux is doing next to iCloud in the file manager's sidebar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+icloud-core = { version = "0.2.0", path = "../icloud-core" }
+signal-hook = "0.4.4"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[dev-dependencies]
+tempfile = "3.27.0"

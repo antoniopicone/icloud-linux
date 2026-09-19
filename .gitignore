@@ -1,6 +1,4 @@
-sample-*.py
-samples/
-__pycache__/*.bak
+/target
+/target-shots
 .claude/
-.vscode/
-.env
+*.bak

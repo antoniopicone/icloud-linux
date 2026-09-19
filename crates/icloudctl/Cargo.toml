@@ -1,0 +1,36 @@
+[package]
+name = "icloudctl"
+description = "Command line control tool for icloud-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+icloud-api = { version = "0.2.0", path = "../icloud-api" }
+icloud-core = { version = "0.2.0", path = "../icloud-core" }
+rpassword = "7.5.4"
+secrecy = "0.10.3"
+serde_json = "1.0.151"
+signal-hook = "0.4.4"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[dev-dependencies]
+base64 = "0.23.1"
+httpmock = "0.8.3"
+icloud-api = { path = "../icloud-api", features = ["testing"] }
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+
+[lib]
+name = "icloudctl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "icloudctl"
+path = "src/main.rs"

@@ -1,0 +1,12 @@
+# Linux build and test environment: GTK4 for the installer, FUSE 3 for the mount
+# tests, and Xvfb + ImageMagick to run and photograph the installer headlessly.
+FROM docker.io/library/rust:1-bookworm
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libgtk-4-dev pkg-config fuse3 cmake libglib2.0-dev \
+      xvfb xauth dbus-x11 imagemagick x11-utils fonts-dejavu-core \
+      adwaita-icon-theme gsettings-desktop-schemas procps \
+ && rm -rf /var/lib/apt/lists/*
+RUN rustup component add rustfmt clippy
+# Keep build products out of the source tree, and let containers share them.
+ENV CARGO_TARGET_DIR=/cargo-target
