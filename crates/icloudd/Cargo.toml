@@ -1,0 +1,31 @@
+[package]
+name = "icloudd"
+description = "FUSE daemon that mounts iCloud Drive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+fuser = "0.18.0"
+icloud-api = { version = "0.2.0", path = "../icloud-api" }
+icloud-core = { version = "0.2.0", path = "../icloud-core" }
+signal-hook = "0.4.4"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[dev-dependencies]
+icloud-api = { path = "../icloud-api", features = ["testing"] }
+tempfile = "3.27.0"
+
+[lib]
+name = "icloudd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "icloudd"
+path = "src/main.rs"

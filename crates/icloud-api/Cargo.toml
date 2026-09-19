@@ -1,0 +1,35 @@
+[package]
+name = "icloud-api"
+description = "Blocking client for the iCloud web services used by icloud-linux (auth, 2FA, Drive)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exposes `MemoryDrive`, an in-memory `Drive` implementation for tests of
+# crates that sit on top of this one.
+testing = []
+
+[dependencies]
+base64 = "0.23.1"
+cookie_store = "0.22.1"
+mime_guess = "2.0.5"
+num-bigint = "0.5.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls", "cookies", "multipart", "query", "form"] }
+reqwest_cookie_store = "0.10.0"
+ring = "0.17.14"
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+time = { version = "0.3.55", features = ["parsing", "formatting"] }
+tracing = "0.1.44"
+url = "2.5.8"
+
+[dev-dependencies]
+httpmock = "0.8.3"
+tempfile = "3.27.0"

@@ -1,0 +1,27 @@
+[package]
+name = "icloud-core"
+description = "Sync engine, local mirror, state database and setup logic for icloud-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+icloud-api = { version = "0.2.0", path = "../icloud-api" }
+ring = "0.17.14"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustix = { version = "1.1.5", features = ["fs", "process", "mount"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+time = { version = "0.3.55", features = ["formatting", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+icloud-api = { path = "../icloud-api", features = ["testing"] }

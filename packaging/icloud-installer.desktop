@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=iCloud for Linux Setup
+Comment=Set up iCloud Drive as a folder on this computer
+Exec=icloud-installer
+Icon=folder-remote
+Terminal=false
+Categories=Utility;Network;Settings;
+Keywords=iCloud;Apple;sync;drive;
