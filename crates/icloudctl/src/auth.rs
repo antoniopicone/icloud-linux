@@ -60,6 +60,22 @@ fn two_factor(client: &Client, options: &AuthOptions, ui: &mut dyn Prompter) -> 
         ));
     }
 
+    if choices.push_bridge {
+        if choices.can_use_sms() {
+            ui.say(
+                "Apple no longer shows a code on your devices for this sign-in unless the app performs a push \
+                 handshake that icloudctl does not implement yet. A text message is used instead.",
+            );
+        } else {
+            return Err(Error::Setup(
+                "Apple only offers a code on your trusted devices for this account, and that needs a push \
+                 handshake that icloudctl does not implement yet. Sign in at icloud.com once and import the \
+                 browser trust token instead: `icloudctl auth --trust-token <value>`"
+                    .into(),
+            ));
+        }
+    }
+
     let mut method = if options.force_sms { CodeMethod::Sms } else { choices.preferred_method() };
     if method == CodeMethod::Sms && !choices.can_use_sms() {
         ui.say("No trusted phone number is available for SMS; falling back to the code on a trusted device.");
@@ -71,7 +87,7 @@ fn two_factor(client: &Client, options: &AuthOptions, ui: &mut dyn Prompter) -> 
         phone = Some(send_sms(client, &choices, ui)?);
     } else {
         ui.say("Look at your trusted Apple devices for a verification code.");
-        if choices.can_use_sms() {
+        if choices.can_use_sms() && !choices.push_bridge {
             ui.say("No code arrived? Type `sms` at the prompt to have one texted to you.");
         }
     }

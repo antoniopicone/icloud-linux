@@ -22,6 +22,7 @@ struct Mounted {
     _session: BackgroundSession,
     _dir: tempfile::TempDir,
     mount: PathBuf,
+    cache: PathBuf,
     drive: Arc<MemoryDrive>,
     engine: Engine,
     state: Arc<SyncState>,
@@ -62,14 +63,20 @@ fn mount(policy: SyncPolicy, read_only: bool) -> Option<Mounted> {
         policy.clone(),
         EngineConfig { auto_sync: false, ..EngineConfig::default() },
     );
-    let core = Arc::new(FsCore::new(mirror, state.clone(), policy, Some(engine.clone()), FsOptions { read_only }));
+    let core = Arc::new(FsCore::new(
+        mirror,
+        state.clone(),
+        policy,
+        Some(engine.clone()),
+        FsOptions { read_only, ..FsOptions::default() },
+    ));
 
     let mut config = MountConfig::default();
     config.mount_options = vec![MountOption::FSName("icloud-test".into())];
     config.n_threads = Some(8);
     config.clone_fd = true;
     let session = Session::new(IcloudFs::new(core), &mount, &config).expect("mount").spawn().expect("spawn");
-    Some(Mounted { _session: session, _dir: dir, mount, drive, engine, state })
+    Some(Mounted { _session: session, _dir: dir, mount, cache, drive, engine, state })
 }
 
 fn mounted() -> Option<Mounted> {
@@ -367,4 +374,104 @@ fn extended_attributes_are_simply_absent() {
     let copy = m.mount.parent().unwrap().join("copy.txt");
     fs::copy(m.path("f.txt"), &copy).unwrap();
     assert_eq!(fs::read(copy).unwrap(), b"x");
+}
+
+// ---- who may cause a download ---------------------------------------------------------
+
+/// A copy of `cat` under another name: to the kernel and to `/proc` it is a
+/// program called `name`, which is all the daemon looks at.
+fn cat_named(dir: &Path, name: &str) -> PathBuf {
+    let cat = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|d| d.join("cat"))
+        .find(|p| p.is_file())
+        .expect("cat is installed");
+    let copy = dir.join(name);
+    fs::copy(cat, &copy).unwrap();
+    copy
+}
+
+/// Read `file` with the program at `program`; the error text when it fails.
+fn read_with(program: &Path, file: &Path) -> Result<Vec<u8>, String> {
+    let out = std::process::Command::new(program).arg(file).output().unwrap();
+    if out.status.success() { Ok(out.stdout) } else { Err(String::from_utf8_lossy(&out.stderr).into_owned()) }
+}
+
+#[test]
+fn a_search_indexer_walking_the_mount_downloads_nothing() {
+    let Some(m) = mounted() else { return };
+    m.drive.add_file("/", "small.txt", b"hello", 1);
+    let indexer = cat_named(&m.cache, "tracker-extract-3");
+
+    let err = read_with(&indexer, &m.path("small.txt")).unwrap_err();
+    assert!(err.contains("Permission denied"), "{err}");
+    assert_eq!(m.drive.calls_matching("open:"), 0);
+
+    // A person, a moment later, is served as usual: the refusal was not cached.
+    assert_eq!(fs::read_to_string(m.path("small.txt")).unwrap(), "hello");
+    assert_eq!(m.drive.calls_matching("open:"), 1);
+}
+
+#[test]
+fn a_thumbnailer_gets_small_files_and_is_refused_big_ones() {
+    let Some(m) = mounted() else { return };
+    m.drive.add_file("/", "small.png", &[1u8; 1_000], 1);
+    m.drive.add_file("/", "big.png", &vec![2u8; 300_000], 1);
+    let thumbnailer = cat_named(&m.cache, "gdk-pixbuf-thumbnailer");
+
+    assert_eq!(read_with(&thumbnailer, &m.path("small.png")).unwrap().len(), 1_000);
+    assert_eq!(m.drive.calls_matching("open:"), 1);
+
+    let err = read_with(&thumbnailer, &m.path("big.png")).unwrap_err();
+    assert!(err.contains("Permission denied"), "{err}");
+    assert_eq!(m.drive.calls_matching("open:"), 1, "300 kB is over the 200 kB preview limit");
+
+    // Opening it is what downloads it.
+    assert_eq!(fs::read(m.path("big.png")).unwrap().len(), 300_000);
+    assert_eq!(m.drive.calls_matching("open:"), 2);
+    // And once it is local the thumbnailer may read it.
+    assert_eq!(read_with(&thumbnailer, &m.path("big.png")).unwrap().len(), 300_000);
+}
+
+#[test]
+fn browsing_and_stat_never_download_even_for_a_person() {
+    let Some(m) = mounted() else { return };
+    m.drive.add_file("/", "a.pdf", &[1u8; 5_000], 1);
+    m.drive.add_folder("/", "Docs");
+    m.drive.add_file("/Docs", "b.pdf", &[2u8; 5_000], 1);
+    assert_eq!(names(&m.mount), ["Docs", "a.pdf"]);
+    assert_eq!(names(&m.path("Docs")), ["b.pdf"]);
+    for name in ["a.pdf", "Docs/b.pdf"] {
+        assert_eq!(fs::metadata(m.path(name)).unwrap().len(), 5_000);
+    }
+    assert_eq!(m.drive.calls_matching("open:"), 0);
+}
+
+#[test]
+fn downloading_a_chosen_folder_fetches_those_files_and_no_others() {
+    use icloud_core::{Config, hydrate};
+
+    let Some(m) = mounted() else { return };
+    m.drive.add_file("/", "other.bin", &[9u8; 100], 1);
+    m.drive.add_folder("/", "Docs");
+    m.drive.add_file("/Docs", "a.txt", b"alpha", 1);
+    m.drive.add_folder("/Docs", "Deep");
+    m.drive.add_file("/Docs/Deep", "b.txt", b"beta", 1);
+    // Nothing was opened yet: "Docs" and "Deep" have never been listed.
+
+    let config = Config { cache_dir: m.cache.clone(), ..Config::default() };
+    let selection = hydrate::resolve_selection(&m.mount, &[m.path("Docs")], Path::new("/")).unwrap();
+    assert_eq!(selection.files.len(), 2, "{selection:?}");
+    let plan = hydrate::plan_files(&config, &selection.files).unwrap();
+    assert_eq!(plan.pending.len(), 2);
+    assert_eq!(plan.pending_bytes(), 9);
+    assert_eq!(m.drive.calls_matching("open:"), 0, "choosing a folder must not download by itself");
+
+    let report = hydrate::run(&m.mount, &plan, &std::sync::atomic::AtomicBool::new(false), |_, _| {});
+    assert_eq!((report.succeeded, report.failed.len()), (2, 0));
+    assert_eq!(m.drive.calls_matching("open:"), 2, "exactly the two files, not other.bin");
+
+    let again = hydrate::plan_files(&config, &selection.files).unwrap();
+    assert!(again.pending.is_empty() && again.already_local == 2);
 }

@@ -154,6 +154,13 @@ fn handle(auth: &mut dyn Authenticator, request: AuthRequest, attempts_left: &mu
                          Sign in once at icloud.com and import the browser trust token with `icloudctl auth --trust-token`."
                             .into(),
                     )]
+                } else if options.push_bridge && !options.can_use_sms() {
+                    vec![AuthEvent::Failed(
+                        "Apple only offers a code on your trusted devices for this account, and that needs a push \
+                         handshake this app does not implement yet. Sign in once at icloud.com and import the \
+                         browser trust token with `icloudctl auth --trust-token`."
+                            .into(),
+                    )]
                 } else {
                     vec![AuthEvent::CodeNeeded(options)]
                 }
@@ -238,7 +245,11 @@ pub(crate) mod tests {
             let fake = Self {
                 login: VecDeque::new(),
                 verify: VecDeque::new(),
-                options: TwoFactorOptions { has_trusted_devices: true, phones: phones(), security_key_required: false },
+                options: TwoFactorOptions {
+                    has_trusted_devices: true,
+                    phones: phones(),
+                    ..TwoFactorOptions::default()
+                },
                 log: log.clone(),
             };
             (fake, log)
@@ -319,7 +330,7 @@ pub(crate) mod tests {
     fn a_security_key_only_account_is_told_what_to_do_instead() {
         let (mut fake, _) = Fake::new();
         fake.login.push_back(Ok(LoginStatus::TwoFactorRequired));
-        fake.options = TwoFactorOptions { has_trusted_devices: false, phones: vec![], security_key_required: true };
+        fake.options = TwoFactorOptions { security_key_required: true, ..TwoFactorOptions::default() };
         let w = worker(fake);
         w.request(AuthRequest::Login(pw()));
         match w.wait(WAIT) {

@@ -37,11 +37,12 @@ pub enum CrawlMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WarmupMode {
-    /// Fetch everything eligible in the background once it is known.
+    /// Fetch a file only when a person opens it or asks to download it.
     #[default]
-    Background,
-    /// Fetch a file only when it is opened.
     Lazy,
+    /// Fetch everything eligible in the background once it is known. This
+    /// mirrors the whole drive onto the disk; it has to be asked for.
+    Background,
 }
 
 /// What happens when a path changed both here and on iCloud.
@@ -93,6 +94,10 @@ pub struct Config {
     pub upload_interval_seconds: u64,
     pub remote_refresh_interval_seconds: u64,
     pub warmup_workers: usize,
+    /// Largest file, in bytes, that a thumbnail generator may cause to be
+    /// downloaded (default 200 kB). Larger files get no preview until they
+    /// are downloaded on purpose; 0 means no file is downloaded for a preview.
+    pub preview_max_bytes: u64,
     /// Allow-list of iCloud paths; empty means all.
     pub sync_paths: Vec<String>,
     /// Deny-list of iCloud paths; wins over `sync_paths`.
@@ -117,6 +122,7 @@ impl Default for Config {
             upload_interval_seconds: 30,
             remote_refresh_interval_seconds: 300,
             warmup_workers: 1,
+            preview_max_bytes: crate::reader::DEFAULT_PREVIEW_MAX_BYTES,
             sync_paths: Vec::new(),
             exclude_paths: Vec::new(),
             auto_sync: true,

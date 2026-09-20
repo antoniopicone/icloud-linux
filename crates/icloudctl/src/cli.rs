@@ -7,6 +7,10 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "icloudctl", version, about = "Control the icloud-linux service", propagate_version = true)]
 pub struct Cli {
+    /// Log what happens on the wire (addresses and status codes only; never
+    /// passwords, tokens or cookies). Same as `ICLOUD_LOG=debug`.
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -41,7 +45,7 @@ pub enum Command {
         /// Import a `X-APPLE-WEBAUTH-HSA-TRUST` value from a signed-in browser.
         #[arg(long, value_name = "TOKEN")]
         trust_token: Option<String>,
-        /// Show what Apple reported about the challenge.
+        /// Show what Apple reported about the challenge, and enable `--verbose`.
         #[arg(long)]
         debug: bool,
     },
@@ -71,6 +75,19 @@ pub enum Command {
         #[arg(long)]
         verbose: bool,
     },
+    /// Download files or folders from iCloud Drive to this computer now.
+    ///
+    /// This is what "Download from iCloud" in the right-click menu runs.
+    /// Nothing else downloads a file's contents except opening it.
+    Download {
+        /// Files or folders inside iCloud Drive. Without any, the selection
+        /// the file manager passes in the environment is used.
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
+        /// Report progress and the result as desktop notifications.
+        #[arg(long)]
+        notify: bool,
+    },
     /// Show whether the service is running.
     Status,
     /// Follow the service's log.
@@ -89,6 +106,10 @@ pub enum Command {
     /// Stop showing activity in the Files sidebar.
     #[command(alias = "nautilus-uninstall")]
     StatusUninstall,
+    /// Add "Download from iCloud" to the right-click menu of Files (Nautilus).
+    MenuInstall,
+    /// Remove "Download from iCloud" from the right-click menu.
+    MenuUninstall,
     /// Keep GNOME's search indexer out of the mount, where it would otherwise
     /// download the whole drive.
     Trackerignore,
@@ -111,6 +132,15 @@ mod tests {
 
     fn parse(args: &[&str]) -> Command {
         Cli::try_parse_from(std::iter::once("icloudctl").chain(args.iter().copied())).unwrap().command
+    }
+
+    #[test]
+    fn download_takes_paths_and_the_file_managers_double_dash() {
+        assert!(matches!(
+            parse(&["download", "--notify", "--", "a b.pdf", "Docs"]),
+            Command::Download { paths, notify: true } if paths == [PathBuf::from("a b.pdf"), PathBuf::from("Docs")]
+        ));
+        assert!(matches!(parse(&["download"]), Command::Download { paths, notify: false } if paths.is_empty()));
     }
 
     #[test]

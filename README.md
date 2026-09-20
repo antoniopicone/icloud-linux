@@ -1,6 +1,6 @@
 # icloud-linux
 
-Mount iCloud Drive on Linux as a normal folder. Folders open the way they do in Finder, files download when you use them, and what you change is uploaded for you.
+Mount iCloud Drive on Linux as a normal folder. Folders open the way they do in Finder, a file downloads when you open it or choose **Download from iCloud** in its right-click menu, and what you change is uploaded for you.
 
 ```
 ~/iCloud/
@@ -18,10 +18,10 @@ This is a Rust rewrite of the earlier Python implementation. What has and has no
 | | |
 |---|---|
 | Sync engine, cache, FUSE layer | Tested against an in-memory iCloud and through **real kernel FUSE mounts** (`std::fs` calls on a live mount). |
-| Sign-in (SRP), two-factor, Drive requests | Ported from `pyicloud` 2.7.0. The SRP maths is checked byte for byte against the reference Python library; the request sequences against scripted stand-ins. **Not yet exercised against Apple's live servers**, because that needs a real account. |
-| Installer window | Run headlessly in demo mode and inspected screenshot by screenshot. Not yet run on a real desktop. |
+| Sign-in (SRP), two-factor, Drive requests | Ported from `pyicloud` 2.7.0. The SRP maths is checked byte for byte against the reference Python library and the request sequences against scripted stand-ins. **Confirmed on a real account:** sign-in with a text-message code, listing folders and downloading files. **Not confirmed yet:** uploads, and the code-on-your-devices method (see Signing in). |
+| Installer window | Run headlessly in demo mode and inspected screenshot by screenshot; used on a real desktop as far as the sign-in step. |
 
-Until you have signed in once with a real account, treat the network layer as unproven. `icloudctl auth` sends the password proof once and never retries, so a mismatch cannot lock your account by itself.
+`icloudctl auth` sends the password proof once and never retries, so a mismatch cannot lock your account by itself.
 
 Linux only. FUSE 3 and systemd (user services) are required.
 
@@ -90,11 +90,11 @@ Two-factor works three ways:
 
 | Method | |
 |---|---|
-| Code from a trusted device | Type the six digits your iPhone/iPad/Mac shows. |
-| Text message | `icloudctl auth --force-sms`, or type `sms` at the prompt. |
+| Text message | `icloudctl auth --force-sms`, or type `sms` at the prompt. Works for every account with a trusted phone number, and is what the installer offers. |
+| Code from a trusted device | Type the six digits your iPhone/iPad/Mac shows. Only for accounts where Apple sends it by itself; see below. |
 | Browser trust token | `icloudctl auth --trust-token <X-APPLE-WEBAUTH-HSA-TRUST from icloud.com cookies>` skips the code. |
 
-Not supported: Apple's newer push-to-device bridge and hardware security keys. If your account can only use those, sign in at icloud.com once and import the trust token above. If a push popup appears instead of a code, use the text message.
+Not supported: Apple's newer push-to-device bridge and hardware security keys. On most accounts Apple no longer shows a code on your devices unless the app performs that push handshake (the sign-in page announces it as `auth/bridge/step`); nothing would ever arrive, so those accounts are steered to the text message instead of being left waiting. If your account can only use those, sign in at icloud.com once and import the trust token above. If a push popup appears instead of a code, use the text message.
 
 A wrong code counts towards Apple locking the account, so the installer and `icloudctl auth` both stop after three.
 
@@ -102,6 +102,8 @@ A wrong code counts towards Apple locking the account, so the installer and `icl
 
 ```
 icloudctl start | stop | restart | status | logs
+icloudctl download PATH...         download these files or folders now (the right-click entry runs this)
+icloudctl menu-install | menu-uninstall   add or remove "Download from iCloud" in Files' right-click menu
 icloudctl sync [--timeout SEC]     refresh from iCloud now and wait for it
 icloudctl refresh                  ask for a refresh without waiting
 icloudctl hydrate [--dry-run]      download every eligible file that is not local yet
@@ -116,7 +118,11 @@ icloudctl uninstall [--purge]
 
 **Listing.** Nothing is crawled at startup. A folder is listed from iCloud the first time something reads it, and at most once per `remote_refresh_interval_seconds`. `ls ~/iCloud` lists the root and nothing else. The mount is up in seconds however large the drive is. Listing never downloads file contents: each file is a sparse placeholder with the right name, size and date. (`crawl_mode: full` restores a whole-drive crawl if you prefer it.)
 
-**Downloading.** Opening a file downloads it, once, into `~/.cache/icloud-linux/mirror`, writing to a temporary file and renaming into place so a reader never sees half a file. A download that raced with a local delete or an edit is discarded rather than committed.
+**Downloading.** A file's contents are fetched only when a person asks: by opening it (double click) or by choosing **Download from iCloud** on it (or on a folder) in the right-click menu of Files, under *Scripts*. It is downloaded once into `~/.cache/icloud-linux/mirror`, writing to a temporary file and renaming into place so a reader never sees half a file. A download that raced with a local delete or an edit is discarded rather than committed.
+
+Programs that walk the drive on their own do not trigger downloads. The daemon looks at which program is reading: search indexers (Tracker, LocalSearch, Baloo) are turned away with "permission denied", and thumbnailers get a preview only for files up to `preview_max_bytes` (200 kB by default). Bigger files show a generic icon until you download them. This keeps a folder from being pulled down file by file just because you looked at it, and keeps that queue from delaying the file you did open. Files that are already local are read freely by everyone.
+
+A thumbnailer that was turned away is remembered by Files as "failed" (in `~/.cache/thumbnails/fail`), so `icloudctl download` clears that note for the files it fetched and the thumbnail appears the next time the folder is drawn. For a file you open some other way, `rm -r ~/.cache/thumbnails/fail` does the same for everything.
 
 **Uploading.** Writes go to the mirror and mark the file dirty; a pass every 30 seconds sends what changed. A rename or move is a rename or move on iCloud, not a re-upload. If a file changes *while* it is uploading, it stays dirty and goes up again. Deletes go to iCloud's "Recently Deleted" (`delete_mode: permanent` changes that).
 
@@ -128,7 +134,11 @@ icloudctl uninstall [--purge]
 
 ## Desktop integration
 
-GNOME's file indexer walks `$HOME` and opens every file. On a mount that looks like a person opening everything, and it would download the whole drive within seconds. The daemon writes a `.trackerignore` marker into the mirror to prevent that; `icloudctl trackerignore` applies it to an existing install, and `icloudctl doctor` reports whether it is in place.
+**Sidebar.** iCloud appears once in the Files sidebar, as a folder named *iCloud*, and `icloud-status` adds what it is doing to the name: `iCloud (downloading: invoice.pdf)`. The mount is deliberately not listed as a drive: it would otherwise show up a second time as a removable disk with an eject button. Use `icloudctl stop` to unmount. (Files shows a cloud icon and a progress indicator only for sync clients that register with libcloudproviders, which needs a file installed system-wide; not done here.)
+
+**Right-click.** *Scripts ▸ Download from iCloud* on any file or folder inside iCloud Drive. It is a script in `~/.local/share/nautilus/scripts`, so nothing has to be loaded into Files and no extra package is needed. A desktop notification reports the start and the result. Add or remove it with `icloudctl menu-install` / `menu-uninstall`.
+
+**Search indexer.** GNOME's file indexer walks `$HOME` and opens every file. On a mount that looks like a person opening everything, and it would download the whole drive within seconds. The daemon writes a `.trackerignore` marker into the mirror to prevent that; `icloudctl trackerignore` applies it to an existing install, and `icloudctl doctor` reports whether it is in place. As a second line of defence the daemon refuses the indexer's reads of files that are not downloaded (see Downloading).
 
 `icloudctl status-install` puts what the daemon is doing in the sidebar label of the `iCloud` entry: `iCloud (listing: Documents)`, `iCloud (downloading: invoice.pdf)`, plain `iCloud` when idle. It is a small user service, `icloud-status`, that follows the daemon's log and rewrites one line of `~/.config/gtk-3.0/bookmarks`, which Nautilus and every GTK file dialog watch, so it needs no Nautilus plugin and no Python. It stops with the daemon and puts the plain label back.
 
@@ -188,6 +198,8 @@ icloudctl doctor      # first thing to try
 icloudctl logs
 ```
 
+- **Sign-in says the email/password is wrong** — the message ends with what Apple actually answered, e.g. `(Apple replied: … -20101 …)` for a wrong password or `403` for a locked or throttled account. Run `icloudctl -v auth` to see each request's address and status code (never passwords, tokens or cookies); the installer does the same with `ICLOUD_LOG=debug icloud-installer`. Check the password at <https://account.apple.com> first, and do not retry more than a couple of times: repeated failures lock the account.
+- **A picture or PDF shows a generic icon** — its contents are not downloaded just to draw a thumbnail when the file is larger than `preview_max_bytes`. Right-click ▸ Scripts ▸ Download from iCloud, or open it.
 - **`UNAUTHENTICATED mode` in the logs** — the session is gone. `icloudctl auth`, then `icloudctl restart`.
 - **The whole drive starts downloading by itself** — the desktop indexer is walking the mount: `icloudctl trackerignore`.
 - **A folder looks empty** — check `icloudctl logs` for a `list-directory-start` with no matching `list-directory-complete`; the listing request failed.

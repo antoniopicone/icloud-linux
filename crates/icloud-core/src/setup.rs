@@ -359,6 +359,7 @@ pub fn daemon_pid(sys: &dyn Systemctl) -> Option<i32> {
 /// Remove the service. With `purge`, configuration, session and cache too.
 pub fn uninstall(layout: &Layout, sys: &dyn Systemctl, purge: bool) -> Result<()> {
     remove_status_service(layout, sys)?;
+    remove_menu(layout)?;
     let _ = sys.run(&["stop", SERVICE_NAME]);
     let _ = sys.run(&["disable", SERVICE_NAME]);
     remove_file_if_exists(&layout.service_file())?;
@@ -468,6 +469,66 @@ pub fn remove_status_service(layout: &Layout, sys: &dyn Systemctl) -> Result<()>
     remove_file_if_exists(&status_unit_file(layout))?;
     let _ = sys.run(&["daemon-reload"]);
     Ok(())
+}
+
+// ---- right-click menu -------------------------------------------------------------
+
+/// The label of the entry in the file manager's context menu.
+pub const MENU_ENTRY: &str = "Download from iCloud";
+
+/// Where Nautilus looks for the scripts it lists under *Scripts* in the
+/// right-click menu.
+pub fn menu_script_file(layout: &Layout) -> PathBuf {
+    layout.data_home.join("nautilus/scripts").join(MENU_ENTRY)
+}
+
+pub fn menu_installed(layout: &Layout) -> bool {
+    menu_script_file(layout).exists()
+}
+
+/// The script behind the menu entry. Nautilus hands it the selection as
+/// arguments and in `NAUTILUS_SCRIPT_SELECTED_FILE_PATHS`; `icloudctl download`
+/// understands both.
+fn menu_script(icloudctl: &Path) -> Result<String> {
+    let binary = icloudctl.to_string_lossy();
+    if binary.contains(['\n', '\r']) {
+        return Err(Error::Setup("paths must not contain newlines".into()));
+    }
+    Ok(format!(
+        "#!/bin/sh\n\
+         # Installed by `icloudctl menu-install`; remove with `icloudctl menu-uninstall`.\n\
+         # Right-click a file or folder in iCloud Drive: Scripts > {MENU_ENTRY}.\n\
+         exec {} download --notify -- \"$@\"\n",
+        shell_quote(&binary)
+    ))
+}
+
+/// Add "Download from iCloud" to the right-click menu of Nautilus.
+///
+/// It is a plain script in Nautilus's scripts folder, so nothing has to be
+/// loaded into the file manager and no extra package is needed.
+pub fn install_menu(layout: &Layout, icloudctl: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let target = menu_script_file(layout);
+    if let Some(dir) = target.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&target, menu_script(icloudctl)?)?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+    Ok(target)
+}
+
+/// [`install_menu`] for the `icloudctl` this program was started from.
+pub fn install_menu_here(layout: &Layout) -> Result<PathBuf> {
+    let binary = locate_binary("icloudctl")
+        .ok_or_else(|| Error::Setup("cannot find `icloudctl` next to this program or on PATH".into()))?;
+    install_menu(layout, &binary)
+}
+
+/// Remove the menu entry. Removing what is not there is fine.
+pub fn remove_menu(layout: &Layout) -> Result<()> {
+    remove_file_if_exists(&menu_script_file(layout))
 }
 
 /// Create the marker that keeps GNOME's indexer out of the mirror, and nudge
@@ -612,6 +673,12 @@ pub fn doctor(layout: &Layout, sys: &dyn Systemctl) -> Vec<Check> {
         Check::new(Severity::Ok, "sidebar status service installed")
     } else {
         Check::new(Severity::Info, "sidebar status service not installed").with_fix("run `icloudctl status-install`")
+    });
+    checks.push(if menu_installed(layout) {
+        Check::new(Severity::Ok, format!("right-click entry installed (Scripts > {MENU_ENTRY})"))
+    } else {
+        Check::new(Severity::Info, "right-click entry \"Download from iCloud\" not installed")
+            .with_fix("run `icloudctl menu-install`")
     });
     checks
 }
@@ -978,6 +1045,64 @@ mod tests {
         sys.calls.lock().unwrap().clear();
         remove_status_service(&layout, &sys).unwrap();
         assert!(sys.calls().is_empty(), "nothing to remove means nothing to run");
+    }
+
+    #[test]
+    fn the_menu_entry_is_an_executable_script_that_calls_icloudctl_download() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, layout, _) = setup();
+        assert!(!menu_installed(&layout));
+        let script = install_menu(&layout, Path::new("/opt/my apps/icloudctl")).unwrap();
+        assert_eq!(script, layout.data_home.join("nautilus/scripts/Download from iCloud"));
+        assert!(menu_installed(&layout));
+        assert_eq!(fs::metadata(&script).unwrap().permissions().mode() & 0o777, 0o755);
+        let text = fs::read_to_string(&script).unwrap();
+        assert!(text.starts_with("#!/bin/sh\n"));
+        assert!(text.contains("exec '/opt/my apps/icloudctl' download --notify -- \"$@\""), "{text}");
+
+        install_menu(&layout, Path::new("/new/icloudctl")).unwrap();
+        assert!(fs::read_to_string(&script).unwrap().contains("/new/icloudctl"), "reinstalling updates the path");
+
+        remove_menu(&layout).unwrap();
+        assert!(!menu_installed(&layout));
+        remove_menu(&layout).unwrap();
+    }
+
+    #[test]
+    fn a_quote_in_the_binary_path_cannot_break_out_of_the_script() {
+        let (_d, layout, _) = setup();
+        let script = install_menu(&layout, Path::new("/tmp/it's; rm -rf ~/icloudctl")).unwrap();
+        let text = fs::read_to_string(script).unwrap();
+        assert!(text.contains("exec '/tmp/it'\\''s; rm -rf ~/icloudctl' download"), "{text}");
+        assert!(install_menu(&layout, Path::new("/a\nb")).is_err());
+    }
+
+    #[test]
+    fn the_menu_script_really_runs_icloudctl_with_the_selection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, layout, _) = setup();
+        let bin_dir = dir.path().join("it's a dir");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake = bin_dir.join("icloudctl");
+        let out = dir.path().join("args.txt");
+        fs::write(&fake, format!("#!/bin/sh\nfor a in \"$@\"; do echo \"[$a]\"; done > '{}'\n", out.display()))
+            .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = install_menu(&layout, &fake).unwrap();
+        let status = Command::new(&script).args(["a file.pdf", "b.txt"]).status().unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(out).unwrap(), "[download]\n[--notify]\n[--]\n[a file.pdf]\n[b.txt]\n");
+    }
+
+    #[test]
+    fn uninstalling_removes_the_menu_entry_too() {
+        let (_d, layout, sys) = setup();
+        install_menu(&layout, Path::new("/x")).unwrap();
+        uninstall(&layout, &sys, false).unwrap();
+        assert!(!menu_installed(&layout));
     }
 
     #[test]

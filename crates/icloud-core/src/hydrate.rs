@@ -1,4 +1,5 @@
-//! `icloudctl hydrate`: download every eligible file that is not local yet.
+//! Explicit downloads: `icloudctl hydrate` (everything eligible) and
+//! `icloudctl download` (what was selected in the file manager).
 //!
 //! Files are read through the mount, so the daemon's own download machinery
 //! does the work. With `crawl_mode: lazy` only folders that have been opened
@@ -6,9 +7,9 @@
 //! example `find DIR -type d`) to make it known.
 
 use std::{
-    fs::File,
+    fs::{self, File},
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -21,6 +22,8 @@ pub struct Plan {
     pub pending: Vec<(IcPath, u64)>,
     /// Eligible files that are already local.
     pub already_local: u64,
+    /// Files left out because they are outside `sync_paths` / in `exclude_paths`.
+    pub excluded: u64,
 }
 
 impl Plan {
@@ -37,18 +40,98 @@ impl Plan {
 pub fn plan(config: &Config) -> Result<Plan> {
     let policy = SyncPolicy::new(&config.sync_paths, &config.exclude_paths);
     let state = SyncState::open(&config.state_db())?;
-    let (mut pending, mut already_local) = (Vec::new(), 0u64);
+    let (mut pending, mut already_local, mut excluded) = (Vec::new(), 0u64, 0u64);
     for entry in state.list_entries()? {
-        if entry.kind != icloud_api::NodeKind::File || entry.tombstone || !policy.allows(&entry.path) {
+        if entry.kind != icloud_api::NodeKind::File || entry.tombstone {
             continue;
         }
-        if entry.hydrated {
+        if !policy.allows(&entry.path) {
+            excluded += 1;
+        } else if entry.hydrated {
             already_local += 1;
         } else {
             pending.push((entry.path, entry.size));
         }
     }
-    Ok(Plan { pending, already_local })
+    Ok(Plan { pending, already_local, excluded })
+}
+
+/// Like [`plan`], for these files only.
+pub fn plan_files(config: &Config, files: &[IcPath]) -> Result<Plan> {
+    let policy = SyncPolicy::new(&config.sync_paths, &config.exclude_paths);
+    let state = SyncState::open(&config.state_db())?;
+    let (mut pending, mut already_local, mut excluded) = (Vec::new(), 0u64, 0u64);
+    for path in files {
+        let Some(entry) = state.get_entry(path)? else { continue };
+        if entry.kind != icloud_api::NodeKind::File || entry.tombstone {
+            continue;
+        }
+        if !policy.allows(path) {
+            excluded += 1;
+        } else if entry.hydrated {
+            already_local += 1;
+        } else {
+            pending.push((entry.path, entry.size));
+        }
+    }
+    Ok(Plan { pending, already_local, excluded })
+}
+
+/// What was picked in the file manager, sorted into what can be downloaded.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Selection {
+    /// Every file picked, or found below a folder that was picked.
+    pub files: Vec<IcPath>,
+    /// Picked items that are not inside the mount.
+    pub outside: Vec<PathBuf>,
+    /// Picked items that do not exist (any more).
+    pub missing: Vec<PathBuf>,
+}
+
+/// Resolve `picked` (absolute, or relative to `cwd`) against the mount.
+///
+/// Folders are walked, which is what makes the daemon list them: a folder that
+/// was never opened is unknown until then. Only names are fetched by the walk;
+/// no file is downloaded by it.
+pub fn resolve_selection(mount: &Path, picked: &[PathBuf], cwd: &Path) -> std::io::Result<Selection> {
+    let mount = fs::canonicalize(mount)?;
+    let mut selection = Selection::default();
+    for item in picked {
+        let Ok(real) = fs::canonicalize(cwd.join(item)) else {
+            selection.missing.push(item.clone());
+            continue;
+        };
+        let Ok(relative) = real.strip_prefix(&mount) else {
+            selection.outside.push(item.clone());
+            continue;
+        };
+        let Some(start) = relative.to_str().map(|r| IcPath::new(&format!("/{r}"))) else {
+            selection.missing.push(item.clone());
+            continue;
+        };
+        if real.is_dir() {
+            walk(&real, &start, &mut selection.files);
+        } else {
+            selection.files.push(start);
+        }
+    }
+    selection.files.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    selection.files.dedup();
+    Ok(selection)
+}
+
+fn walk(dir: &Path, at: &IcPath, files: &mut Vec<IcPath>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let (Ok(kind), Some(path)) = (entry.file_type(), entry.file_name().to_str().and_then(|n| at.join(n))) else {
+            continue;
+        };
+        if kind.is_dir() {
+            walk(&entry.path(), &path, files);
+        } else if kind.is_file() {
+            files.push(path);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +229,68 @@ mod tests {
         assert_eq!(plan.pending, [(IcPath::new("/Wanted/a.bin"), 100)]);
         assert_eq!(plan.already_local, 1);
         assert_eq!((plan.eligible(), plan.pending_bytes()), (2, 100));
+        assert_eq!(plan.excluded, 2, "/Wanted/Skip/c.bin and /Other/d.bin");
+    }
+
+    #[test]
+    fn a_plan_for_chosen_files_looks_only_at_those() {
+        let (_d, config) = config_with_entries();
+        let chosen = [
+            IcPath::new("/Wanted/a.bin"),
+            IcPath::new("/Wanted/b.bin"),
+            IcPath::new("/Other/d.bin"),
+            IcPath::new("/Wanted/unknown.bin"),
+            IcPath::new("/Wanted/gone.bin"),
+        ];
+        let plan = plan_files(&config, &chosen).unwrap();
+        assert_eq!(plan.pending, [(IcPath::new("/Wanted/a.bin"), 100)]);
+        assert_eq!((plan.already_local, plan.excluded), (1, 1));
+    }
+
+    fn fake_mount() -> tempfile::TempDir {
+        let mount = tempfile::tempdir().unwrap();
+        fs::create_dir_all(mount.path().join("Docs/Deep")).unwrap();
+        fs::write(mount.path().join("top.txt"), b"t").unwrap();
+        fs::write(mount.path().join("Docs/a.txt"), b"a").unwrap();
+        fs::write(mount.path().join("Docs/Deep/b.txt"), b"b").unwrap();
+        mount
+    }
+
+    #[test]
+    fn choosing_a_folder_selects_every_file_below_it() {
+        let mount = fake_mount();
+        let picked = [mount.path().join("Docs")];
+        let selection = resolve_selection(mount.path(), &picked, Path::new("/")).unwrap();
+        assert_eq!(selection.files, [IcPath::new("/Docs/Deep/b.txt"), IcPath::new("/Docs/a.txt")]);
+        assert!(selection.outside.is_empty() && selection.missing.is_empty());
+    }
+
+    #[test]
+    fn relative_choices_are_taken_from_the_working_folder_and_duplicates_collapse() {
+        let mount = fake_mount();
+        let cwd = mount.path().join("Docs");
+        let picked = [PathBuf::from("a.txt"), PathBuf::from("./a.txt"), PathBuf::from("Deep")];
+        let selection = resolve_selection(mount.path(), &picked, &cwd).unwrap();
+        assert_eq!(selection.files, [IcPath::new("/Docs/Deep/b.txt"), IcPath::new("/Docs/a.txt")]);
+    }
+
+    #[test]
+    fn what_is_outside_the_mount_or_gone_is_reported_not_followed() {
+        let mount = fake_mount();
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::write(elsewhere.path().join("x.txt"), b"x").unwrap();
+        // A link out of the mount must not smuggle anything in.
+        std::os::unix::fs::symlink(elsewhere.path(), mount.path().join("link")).unwrap();
+        let picked = [
+            elsewhere.path().join("x.txt"),
+            mount.path().join("link/x.txt"),
+            mount.path().join("nope.txt"),
+            mount.path().join("top.txt"),
+        ];
+        let selection = resolve_selection(mount.path(), &picked, Path::new("/")).unwrap();
+        assert_eq!(selection.files, [IcPath::new("/top.txt")]);
+        assert_eq!(selection.outside.len(), 2);
+        assert_eq!(selection.missing, [mount.path().join("nope.txt")]);
     }
 
     #[test]
@@ -153,8 +298,11 @@ mod tests {
         let mount = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(mount.path().join("d")).unwrap();
         std::fs::write(mount.path().join("d/ok.txt"), b"content").unwrap();
-        let plan =
-            Plan { pending: vec![(IcPath::new("/d/ok.txt"), 7), (IcPath::new("/d/missing.txt"), 1)], already_local: 0 };
+        let plan = Plan {
+            pending: vec![(IcPath::new("/d/ok.txt"), 7), (IcPath::new("/d/missing.txt"), 1)],
+            already_local: 0,
+            excluded: 0,
+        };
         let mut seen = Vec::new();
         let report =
             run(mount.path(), &plan, &AtomicBool::new(false), |path, p| seen.push((path.clone(), p.done, p.failed)));
@@ -168,7 +316,8 @@ mod tests {
     #[test]
     fn cancelling_stops_before_the_next_file() {
         let mount = tempfile::tempdir().unwrap();
-        let plan = Plan { pending: vec![(IcPath::new("/a"), 1), (IcPath::new("/b"), 1)], already_local: 0 };
+        let plan =
+            Plan { pending: vec![(IcPath::new("/a"), 1), (IcPath::new("/b"), 1)], already_local: 0, excluded: 0 };
         let cancel = AtomicBool::new(false);
         let mut calls = 0;
         let report = run(mount.path(), &plan, &cancel, |_, _| {

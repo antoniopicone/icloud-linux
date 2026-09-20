@@ -51,6 +51,14 @@ fn account_reply(trusted: bool) -> serde_json::Value {
 
 /// Script the password half of the conversation up to `signin/complete`.
 fn script_srp(server: &MockServer, complete_status: u16) -> httpmock::Mock<'_> {
+    script_srp_replying(server, complete_status, json!({"authType": "hsa2"}))
+}
+
+fn script_srp_replying(
+    server: &MockServer,
+    complete_status: u16,
+    complete_body: serde_json::Value,
+) -> httpmock::Mock<'_> {
     server.mock(|when, then| {
         when.method(GET).path("/appleauth/auth/authorize/signin");
         then.status(200).header("scnt", "scnt-1").header("X-Apple-ID-Session-Id", "sid-1");
@@ -81,7 +89,7 @@ fn script_srp(server: &MockServer, complete_status: u16) -> httpmock::Mock<'_> {
             .header("content-type", "application/json")
             .header("X-Apple-Session-Token", "session-token-1")
             .header("Set-Cookie", "X-APPLE-WEBAUTH-TOKEN=cookie-value; Path=/")
-            .json_body(json!({"authType": "hsa2"}));
+            .json_body(complete_body);
     })
 }
 
@@ -196,6 +204,29 @@ fn a_rejected_password_is_a_login_failure_and_sends_the_proof_once() {
     assert!(matches!(err, Error::LoginFailed(_)), "got {err:?}");
     assert!(err.is_auth());
     assert_eq!(complete.calls(), 1, "a rejected proof must not be retried");
+}
+
+#[test]
+fn the_failure_carries_what_apple_said_but_nothing_secret() {
+    let server = MockServer::start();
+    script_srp_replying(
+        &server,
+        401,
+        json!({"serviceErrors": [{"code": "-20101", "message": "Your Apple Account or password was incorrect."}]}),
+    );
+    let err = client(&server, None).login(&password()).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("Invalid email/password combination"), "{text}");
+    assert!(text.contains("-20101") && text.contains("was incorrect"), "{text}");
+    assert!(!text.contains("hunter2"), "{text}");
+}
+
+#[test]
+fn a_reply_without_details_still_names_the_status() {
+    let server = MockServer::start();
+    script_srp_replying(&server, 403, json!({}));
+    let err = client(&server, None).login(&password()).unwrap_err();
+    assert!(err.to_string().contains("403"), "{err}");
 }
 
 #[test]

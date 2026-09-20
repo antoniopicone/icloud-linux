@@ -19,7 +19,9 @@ use icloud_core::{Layout, installer::Backend, setup::RealSystemctl};
 const APP_ID: &str = "org.icloud_linux.Installer";
 
 fn main() -> glib::ExitCode {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+    let debug = std::env::var("ICLOUD_LOG").is_ok_and(|v| v.eq_ignore_ascii_case("debug"));
+    let level = if debug { tracing::Level::DEBUG } else { tracing::Level::INFO };
+    tracing_subscriber::fmt().with_max_level(level).init();
 
     let mut demo = false;
     let mut start_page = std::env::var("ICLOUD_INSTALLER_PAGE").ok();

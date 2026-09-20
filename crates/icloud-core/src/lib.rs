@@ -15,10 +15,12 @@ pub mod installer;
 pub mod mirror;
 pub mod path;
 pub mod policy;
+pub mod reader;
 pub mod setup;
 pub mod state;
 pub mod status;
 pub mod sync_request;
+pub mod thumbnails;
 
 pub use config::Config;
 pub use dirs::Layout;
@@ -28,4 +30,5 @@ pub use fs::{Attr, DirItem, Errno, FileKind, FsCore, FsOptions, FsResult};
 pub use mirror::Mirror;
 pub use path::IcPath;
 pub use policy::SyncPolicy;
+pub use reader::{ProcessReader, Reader, Requester};
 pub use state::{Entry, SyncState};

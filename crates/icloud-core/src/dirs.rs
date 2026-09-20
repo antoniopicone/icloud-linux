@@ -25,6 +25,8 @@ pub struct Layout {
     pub systemd_user_dir: PathBuf,
     /// `~/.config`: home of the GTK bookmarks the file manager reads.
     pub config_home: PathBuf,
+    /// `~/.local/share`: where the file manager looks for scripts.
+    pub data_home: PathBuf,
 }
 
 impl Layout {
@@ -43,6 +45,7 @@ impl Layout {
             cache_dir: xdg("XDG_CACHE_HOME", ".cache").join(APP),
             systemd_user_dir: xdg("XDG_CONFIG_HOME", ".config").join("systemd/user"),
             config_home: xdg("XDG_CONFIG_HOME", ".config"),
+            data_home: xdg("XDG_DATA_HOME", ".local/share"),
             home,
         })
     }
@@ -56,6 +59,7 @@ impl Layout {
             cache_dir: root.join(".cache").join(APP),
             systemd_user_dir: root.join(".config/systemd/user"),
             config_home: root.join(".config"),
+            data_home: root.join(".local/share"),
         }
     }
 

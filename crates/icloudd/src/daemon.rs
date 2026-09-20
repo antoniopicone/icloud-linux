@@ -65,8 +65,13 @@ pub fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let core =
-        Arc::new(FsCore::new(mirror, state, policy, engine.clone(), FsOptions { read_only: config.fuse_options.ro }));
+    let core = Arc::new(FsCore::new(
+        mirror,
+        state,
+        policy,
+        engine.clone(),
+        FsOptions { read_only: config.fuse_options.ro, preview_max_bytes: config.preview_max_bytes },
+    ));
     let filesystem = IcloudFs::new(core);
 
     cleanup_mountpoint(&options.mountpoint)?;
@@ -153,9 +158,16 @@ fn write_marker(marker: &Path, text: &str) {
     }
 }
 
+/// The "device" the mount is listed under. `GLib` (hence Files, GNOME's file
+/// manager) hides mounts whose device is `none` from its list of drives, which
+/// is what we want: otherwise the sidebar shows iCloud a second time as a
+/// removable disk, with a disk icon and an eject button, next to the plain
+/// folder entry that carries the activity label.
+const MOUNT_SOURCE: &str = "none";
+
 fn mount_config(config: &Config) -> MountConfig {
     let mut mount = MountConfig::default();
-    mount.mount_options = vec![MountOption::FSName("icloud".into()), MountOption::Subtype("icloud".into())];
+    mount.mount_options = vec![MountOption::FSName(MOUNT_SOURCE.into()), MountOption::Subtype("icloud".into())];
     if config.fuse_options.ro {
         mount.mount_options.push(MountOption::RO);
     }
@@ -176,7 +188,11 @@ mod tests {
         let mount = mount_config(&Config::default());
         assert_eq!(mount.acl, SessionACL::Owner);
         assert!(!mount.mount_options.contains(&MountOption::RO));
-        assert!(mount.mount_options.contains(&MountOption::FSName("icloud".into())));
+        assert!(
+            mount.mount_options.contains(&MountOption::FSName("none".into())),
+            "GLib does not list a mount whose device is `none` as a disk"
+        );
+        assert!(mount.mount_options.contains(&MountOption::Subtype("icloud".into())));
         assert_eq!(mount.n_threads, Some(FUSE_THREADS));
     }
 

@@ -267,6 +267,7 @@ impl Session {
     pub fn send_unchecked(&self, request: RequestBuilder) -> Result<ApiResponse> {
         let response = request.send()?;
         let status = response.status().as_u16();
+        trace_reply(&response);
         let headers = response.headers().clone();
         let mut body = Vec::new();
         response.take(MAX_BODY_BYTES).read_to_end(&mut body)?;
@@ -349,7 +350,7 @@ impl Session {
             return Error::AuthRequired("re-authentication required".into());
         }
         if let Some(Value::Object(map)) = &body
-            && let Some(err) = api_error_from_body(map)
+            && let Some(err) = api_error_from_body(map).or_else(|| service_error(map))
         {
             return err;
         }
@@ -432,6 +433,22 @@ fn api_error_from_body(map: &serde_json::Map<String, Value>) -> Option<Error> {
         .find(|v| !is_falsy(v))
         .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned));
     Some(make_api_error(code, reason))
+}
+
+/// The `serviceErrors` list Apple's identity endpoints use, e.g.
+/// `{"code": "-20101", "message": "Your Apple Account or password was incorrect."}`.
+fn service_error(map: &serde_json::Map<String, Value>) -> Option<Error> {
+    let first = map.get("serviceErrors")?.as_array()?.first()?;
+    let reason = first.get("message").and_then(Value::as_str)?.to_owned();
+    let code = first.get("code").map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned));
+    Some(Error::Api { code, reason })
+}
+
+/// Log the outcome of a request: status and address, never the query string,
+/// headers or body.
+fn trace_reply(response: &Response) {
+    let url = response.url();
+    tracing::debug!(status = response.status().as_u16(), "{}{}", url.host_str().unwrap_or("?"), url.path());
 }
 
 fn is_falsy(value: &Value) -> bool {

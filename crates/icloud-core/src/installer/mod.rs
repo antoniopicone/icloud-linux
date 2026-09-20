@@ -25,8 +25,9 @@ use crate::{
     setup::{self, Check, Severity, Systemctl},
 };
 
-/// What the user chose in the wizard.
+/// What the user chose in the wizard: one checkbox each, hence the flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct InstallPlan {
     pub mount_dir: PathBuf,
     pub crawl_mode: CrawlMode,
@@ -34,6 +35,8 @@ pub struct InstallPlan {
     pub keep_indexer_out: bool,
     /// Label the sidebar entry with what the daemon is doing (`icloud-status`).
     pub show_sidebar_status: bool,
+    /// Add "Download from iCloud" to the right-click menu of the file manager.
+    pub add_context_menu: bool,
     /// Save the password so an expired session can be renewed unattended.
     pub remember_password: bool,
 }
@@ -44,7 +47,8 @@ impl InstallPlan {
             mount_dir: layout.default_mount(),
             crawl_mode: CrawlMode::Lazy,
             keep_indexer_out: true,
-            show_sidebar_status: false,
+            show_sidebar_status: true,
+            add_context_menu: true,
             remember_password: false,
         }
     }
@@ -181,6 +185,15 @@ impl Backend for SystemBackend {
                 Err(err) => StepOutcome::failed("Show activity in the Files sidebar", err),
             });
         }
+        if plan.add_context_menu {
+            steps.push(match setup::install_menu_here(&self.layout) {
+                Ok(_) => StepOutcome::ok(
+                    "Add \"Download from iCloud\" to the right-click menu",
+                    "right-click a file, then Scripts",
+                ),
+                Err(err) => StepOutcome::failed("Add \"Download from iCloud\" to the right-click menu", err),
+            });
+        }
         steps
     }
 }
@@ -280,7 +293,8 @@ mod tests {
         assert_eq!(plan.crawl_mode, CrawlMode::Lazy);
         assert!(plan.keep_indexer_out);
         assert!(!plan.remember_password, "storing the password must be an explicit choice");
-        assert!(!plan.show_sidebar_status, "so must adding a background service");
+        assert!(plan.show_sidebar_status, "seeing what iCloud is doing is part of the experience");
+        assert!(plan.add_context_menu);
     }
 
     #[test]

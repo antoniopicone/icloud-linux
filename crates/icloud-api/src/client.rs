@@ -287,6 +287,7 @@ impl Client {
             )
             .map_err(as_login_failure("Failed to initiate SRP authentication."))?
             .value()?;
+        tracing::debug!("signin/init answered");
 
         let field =
             |key: &str| reply.get(key).ok_or_else(|| Error::Protocol(format!("signin/init reply lacks `{key}`")));
@@ -299,6 +300,7 @@ impl Client {
             .ok_or_else(|| Error::Protocol("invalid PBKDF2 iteration count".into()))?;
         let protocol = Protocol::parse(field("protocol")?.as_str().unwrap_or_default())?;
 
+        tracing::debug!("SRP parameters: protocol {protocol:?}, {iterations} PBKDF2 iterations");
         let derived = derive_password(password.expose_secret(), &salt, iterations, protocol)?;
         let proof = srp
             .process_challenge(&self.account, &derived, &salt, &server_public)
@@ -329,7 +331,10 @@ impl Client {
                 Ok(LoginStatus::TwoFactorRequired)
             }
             Err(err @ Error::Http(_)) => Err(err),
-            Err(_) => Err(Error::LoginFailed("Invalid email/password combination.".into())),
+            Err(other) => {
+                tracing::debug!("signin/complete refused: {other}");
+                Err(Error::LoginFailed(format!("Invalid email/password combination. (Apple replied: {other})")))
+            }
         }
     }
 
@@ -620,7 +625,7 @@ fn decode_b64(value: &Value) -> Result<Vec<u8>> {
 fn as_login_failure(message: &'static str) -> impl Fn(Error) -> Error {
     move |err| match err {
         Error::Http(_) | Error::TwoFactorRequired => err,
-        _ => Error::LoginFailed(message.into()),
+        other => Error::LoginFailed(format!("{message} (Apple replied: {other})")),
     }
 }
 

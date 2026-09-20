@@ -399,7 +399,19 @@ already_configured() {
     [ -f "$cfg" ] && grep -Eq "^username:[[:space:]]*['\"]?[^'\" ]" "$cfg"
 }
 
+# An update keeps the user's setup and adds what newer versions bring: the
+# right-click entry and the activity label in the sidebar. Both are idempotent.
+refresh_integrations() {
+    if "$PREFIX/bin/icloudctl" menu-install >/dev/null 2>&1; then
+        note "Right-click a file in iCloud Drive, then Scripts > Download from iCloud, to keep it on this computer."
+    fi
+    "$PREFIX/bin/icloudctl" status-install >/dev/null 2>&1 || true
+}
+
 run_setup() {
+    if already_configured; then
+        refresh_integrations
+    fi
     if [ "$RUN" != 1 ]; then
         next_steps
         return 0

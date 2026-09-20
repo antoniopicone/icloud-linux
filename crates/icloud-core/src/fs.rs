@@ -30,6 +30,7 @@ use crate::{
     mirror::{Capacity, Mirror},
     path::{IcPath, is_valid_name},
     policy::SyncPolicy,
+    reader::{DEFAULT_PREVIEW_MAX_BYTES, Reader, Requester},
     state::{Entry, SyncState, now},
 };
 
@@ -62,10 +63,19 @@ pub struct DirItem {
     pub kind: FileKind,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct FsOptions {
     /// Refuse every change with `EROFS`.
     pub read_only: bool,
+    /// Largest file a thumbnailer may cause to be downloaded. Bigger ones
+    /// stay placeholders until a person opens or downloads them.
+    pub preview_max_bytes: u64,
+}
+
+impl Default for FsOptions {
+    fn default() -> Self {
+        Self { read_only: false, preview_max_bytes: DEFAULT_PREVIEW_MAX_BYTES }
+    }
 }
 
 pub struct FsCore {
@@ -245,6 +255,12 @@ impl FsCore {
 
     /// Check that `path` can be opened; downloads a file that is not local.
     pub fn open(&self, path: &IcPath, for_write: bool) -> FsResult<()> {
+        self.open_as(path, for_write, &Reader::Person)
+    }
+
+    /// [`open`](Self::open) on behalf of `who`, which decides whether a file
+    /// that is not local may be downloaded for it.
+    pub fn open_as(&self, path: &IcPath, for_write: bool, who: &dyn Requester) -> FsResult<()> {
         if Mirror::is_reserved(path) {
             return Err(Errno::NOENT);
         }
@@ -257,14 +273,31 @@ impl FsCore {
         if entry.is_directory() {
             return Err(Errno::ISDIR);
         }
-        self.ensure_content(path, &entry)
+        self.ensure_content(path, &entry, who)
     }
 
     /// Make sure a file's bytes are in the mirror before they are read or
     /// modified.
-    fn ensure_content(&self, path: &IcPath, entry: &Entry) -> FsResult<()> {
+    ///
+    /// Only people cause downloads. A background reader is turned away with
+    /// `EACCES` (a thumbnailer is let through for small files), so browsing a
+    /// folder never turns into downloading it.
+    fn ensure_content(&self, path: &IcPath, entry: &Entry, who: &dyn Requester) -> FsResult<()> {
         if entry.hydrated || entry.remote_drivewsid.is_none() {
             return Ok(());
+        }
+        match who.reader() {
+            Reader::Person => {}
+            Reader::Preview if entry.size <= self.options.preview_max_bytes => {}
+            other => {
+                tracing::debug!(
+                    "{path}: not downloaded for {} ({} bytes; previews are limited to {})",
+                    other.label(),
+                    entry.size,
+                    self.options.preview_max_bytes
+                );
+                return Err(Errno::ACCESS);
+            }
         }
         let Some(engine) = &self.engine else {
             tracing::warn!("{path} is not downloaded and there is no iCloud session; run `icloudctl auth`");
@@ -284,6 +317,11 @@ impl FsCore {
     }
 
     pub fn read(&self, path: &IcPath, offset: u64, size: usize) -> FsResult<Vec<u8>> {
+        self.read_as(path, offset, size, &Reader::Person)
+    }
+
+    /// [`read`](Self::read) on behalf of `who`.
+    pub fn read_as(&self, path: &IcPath, offset: u64, size: usize, who: &dyn Requester) -> FsResult<Vec<u8>> {
         if Mirror::is_reserved(path) {
             return Err(Errno::NOENT);
         }
@@ -291,7 +329,7 @@ impl FsCore {
         if entry.is_directory() {
             return Err(Errno::ISDIR);
         }
-        self.ensure_content(path, &entry)?;
+        self.ensure_content(path, &entry, who)?;
         self.mirror.read_at(path, offset, size).map_err(|e| log_io("read", path, &e))
     }
 
@@ -359,7 +397,7 @@ impl FsCore {
             if entry.is_directory() {
                 return Err(Errno::ISDIR);
             }
-            self.ensure_content(path, entry)?;
+            self.ensure_content(path, entry, &Reader::Person)?;
         }
         let written = self.mirror.write_at(path, offset, data).map_err(|e| log_io("write", path, &e))?;
         self.record_content_change("write", path, entry.is_some())?;
@@ -373,7 +411,7 @@ impl FsCore {
             if entry.is_directory() {
                 return Err(Errno::ISDIR);
             }
-            self.ensure_content(path, entry)?;
+            self.ensure_content(path, entry, &Reader::Person)?;
         }
         self.mirror.truncate(path, len).map_err(|e| log_io("truncate", path, &e))?;
         self.record_content_change("truncate", path, entry.is_some())
@@ -694,6 +732,79 @@ mod tests {
         rig.fs.open(&p("/top.txt"), false).unwrap();
         assert_eq!(rig.drive.calls_matching("open:"), 1);
         assert!(rig.entry("/top.txt").unwrap().hydrated);
+    }
+
+    // ---- who may cause a download ---------------------------------------------------------
+
+    fn rig_with_previews(limit: u64) -> Rig {
+        let rig = Rig::with(
+            SyncPolicy::unrestricted(),
+            FsOptions { preview_max_bytes: limit, ..FsOptions::default() },
+            EngineConfig { auto_sync: false, ..EngineConfig::default() },
+        );
+        rig.drive.add_file("/", "small.txt", b"0123456789", 1);
+        rig.drive.add_file("/", "big.bin", &[7u8; 64], 1);
+        rig.names("/");
+        rig
+    }
+
+    #[test]
+    fn an_indexer_never_downloads_anything_and_is_told_so_plainly() {
+        let rig = rig_with_previews(1000);
+        assert_eq!(rig.fs.open_as(&p("/small.txt"), false, &Reader::Indexer).unwrap_err(), Errno::ACCESS);
+        assert_eq!(rig.fs.read_as(&p("/small.txt"), 0, 4, &Reader::Indexer).unwrap_err(), Errno::ACCESS);
+        assert_eq!(rig.drive.calls_matching("open:"), 0);
+        assert!(!rig.entry("/small.txt").unwrap().hydrated);
+    }
+
+    #[test]
+    fn a_thumbnailer_gets_small_files_only() {
+        let rig = rig_with_previews(10);
+        assert_eq!(rig.fs.read_as(&p("/big.bin"), 0, 4, &Reader::Preview).unwrap_err(), Errno::ACCESS);
+        assert_eq!(rig.drive.calls_matching("open:"), 0, "64 bytes is over the 10 byte limit");
+        assert_eq!(rig.fs.read_as(&p("/small.txt"), 0, 4, &Reader::Preview).unwrap(), b"0123");
+        assert_eq!(rig.drive.calls_matching("open:"), 1, "10 bytes is exactly at the limit");
+    }
+
+    #[test]
+    fn a_preview_limit_of_zero_means_no_download_for_previews() {
+        let rig = rig_with_previews(0);
+        assert_eq!(rig.fs.open_as(&p("/small.txt"), false, &Reader::Preview).unwrap_err(), Errno::ACCESS);
+        assert_eq!(rig.drive.calls_matching("open:"), 0);
+    }
+
+    #[test]
+    fn a_person_is_never_turned_away_whatever_the_size() {
+        let rig = rig_with_previews(0);
+        assert_eq!(rig.fs.read_as(&p("/big.bin"), 0, 3, &Reader::Person).unwrap(), [7, 7, 7]);
+        assert_eq!(rig.fs.read(&p("/small.txt"), 0, 3).unwrap(), b"012");
+    }
+
+    #[test]
+    fn once_a_file_is_local_background_readers_can_read_it_freely() {
+        let rig = rig_with_previews(0);
+        rig.fs.open(&p("/big.bin"), false).unwrap();
+        assert_eq!(rig.fs.read_as(&p("/big.bin"), 0, 3, &Reader::Indexer).unwrap(), [7, 7, 7]);
+        assert_eq!(rig.fs.read_as(&p("/big.bin"), 0, 3, &Reader::Preview).unwrap(), [7, 7, 7]);
+        assert_eq!(rig.drive.calls_matching("open:"), 1);
+    }
+
+    #[test]
+    fn who_is_asking_is_only_worked_out_when_a_download_is_at_stake() {
+        struct Counting(std::cell::Cell<u32>);
+        impl Requester for Counting {
+            fn reader(&self) -> Reader {
+                self.0.set(self.0.get() + 1);
+                Reader::Person
+            }
+        }
+        let rig = rig_with_previews(0);
+        rig.fs.open(&p("/small.txt"), false).unwrap(); // downloads it
+        let who = Counting(std::cell::Cell::new(0));
+        for _ in 0..5 {
+            rig.fs.read_as(&p("/small.txt"), 0, 1, &who).unwrap();
+        }
+        assert_eq!(who.0.get(), 0, "reads of local files must not touch /proc");
     }
 
     #[test]
@@ -1090,7 +1201,7 @@ mod tests {
     fn read_only_mode_refuses_everything_that_changes_something() {
         let rig = Rig::with(
             SyncPolicy::unrestricted(),
-            FsOptions { read_only: true },
+            FsOptions { read_only: true, ..FsOptions::default() },
             EngineConfig { auto_sync: false, ..EngineConfig::default() },
         );
         rig.drive.add_file("/", "f.txt", b"data", 1);

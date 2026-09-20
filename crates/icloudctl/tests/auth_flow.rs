@@ -143,6 +143,57 @@ fn two_factor_with_a_code_from_a_trusted_device() {
     assert!(ui.said("Type `sms`"), "the SMS escape hatch is offered");
 }
 
+const PAGE_WITH_BRIDGE: &str = r#"<html><script class="boot_args">
+{"direct":{"authInitialRoute":"auth/bridge/step","hasTrustedDevices":true,"twoSV":{"bridgeInitiateData":{"phoneNumberVerification":{
+"trustedPhoneNumber":{"id":7,"pushMode":"sms","numberWithDialCode":"+39 ••• 12"}}}}}}
+</script></html>"#;
+
+#[test]
+fn an_account_on_the_push_bridge_is_sent_a_text_message_instead_of_left_waiting() {
+    let server = MockServer::start();
+    script_password_step(&server, 409);
+    server.mock(|when, then| {
+        when.method(GET).path("/appleauth/auth");
+        then.status(200).header("content-type", "text/html").body(PAGE_WITH_BRIDGE);
+    });
+    let send = server.mock(|when, then| {
+        when.method(PUT).path("/appleauth/auth/verify/phone").body_includes(r#""id":7"#);
+        then.status(200);
+    });
+    let verify = server.mock(|when, then| {
+        when.method(POST).path("/appleauth/auth/verify/phone/securitycode").body_includes(r#""code":"246810""#);
+        then.status(200);
+    });
+    let device = server.mock(|when, then| {
+        when.method(POST).path("/appleauth/auth/verify/trusteddevice/securitycode");
+        then.status(200);
+    });
+    script_trust_and_account(&server);
+
+    let mut ui = Script::new(&["hunter2", "246810"]);
+    run(&client(&server), &config(), &AuthOptions::default(), &mut ui).unwrap();
+    send.assert();
+    verify.assert();
+    assert_eq!(device.calls(), 0);
+    assert!(ui.said("A text message is used instead"), "the user is told why");
+    assert!(!ui.said("Look at your trusted Apple devices"), "no promise of a code that will not come");
+}
+
+#[test]
+fn the_push_bridge_without_a_phone_explains_the_way_out() {
+    let server = MockServer::start();
+    script_password_step(&server, 409);
+    server.mock(|when, then| {
+        when.method(GET).path("/appleauth/auth");
+        then.status(200).header("content-type", "text/html").body(
+            r#"<script class="boot_args">{"direct":{"authInitialRoute":"auth/bridge/step","hasTrustedDevices":true,"twoSV":{"bridgeInitiateData":{"x":1}}}}</script>"#,
+        );
+    });
+    let mut ui = Script::new(&["hunter2"]);
+    let err = run(&client(&server), &config(), &AuthOptions::default(), &mut ui).unwrap_err();
+    assert!(err.to_string().contains("--trust-token"), "{err}");
+}
+
 #[test]
 fn typing_sms_switches_to_a_text_message_and_asks_which_number() {
     let server = MockServer::start();

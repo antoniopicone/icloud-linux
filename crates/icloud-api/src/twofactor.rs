@@ -9,9 +9,13 @@
 //! # Not supported
 //!
 //! Apple's newer "bridge" flow, which pushes the code to a trusted device over
-//! a websocket and runs a SPAKE2+ proof, and FIDO2 security keys. Accounts
-//! that can only use those cannot sign in here; SMS works for everyone with a
-//! trusted phone number, and a browser trust token can be imported instead.
+//! a websocket and runs a SPAKE2+ proof, and FIDO2 security keys. On an
+//! account that uses the bridge, Apple does **not** display a code on the
+//! devices unless that handshake is performed, so offering "a code on your
+//! devices" there would leave the user waiting for nothing. Such accounts are
+//! steered to SMS ([`TwoFactorOptions::device_code_available`]); SMS works for
+//! everyone with a trusted phone number, and a browser trust token can be
+//! imported instead.
 
 use serde_json::Value;
 
@@ -66,15 +70,25 @@ impl TrustedPhone {
 pub struct TwoFactorOptions {
     /// A trusted Apple device is available to show a code.
     pub has_trusted_devices: bool,
+    /// Apple wants the push-bridge handshake (`auth/bridge/step`) before it
+    /// shows a code on those devices. Not implemented here, so no code is
+    /// going to appear unless one was requested some other way.
+    pub push_bridge: bool,
     pub phones: Vec<TrustedPhone>,
     /// Apple demands a hardware security key, which this client cannot use.
     pub security_key_required: bool,
 }
 
 impl TwoFactorOptions {
+    /// Will a code actually show up on the user's devices? Only when a
+    /// trusted device exists and Apple does not insist on the push bridge.
+    pub fn device_code_available(&self) -> bool {
+        self.has_trusted_devices && !self.push_bridge
+    }
+
     /// The method to offer first.
     pub fn preferred_method(&self) -> CodeMethod {
-        if self.has_trusted_devices || self.phones.is_empty() { CodeMethod::TrustedDevice } else { CodeMethod::Sms }
+        if self.device_code_available() || self.phones.is_empty() { CodeMethod::TrustedDevice } else { CodeMethod::Sms }
     }
 
     pub fn can_use_sms(&self) -> bool {
@@ -114,9 +128,15 @@ impl TwoFactorOptions {
             add(phone);
         }
 
+        let has_trusted_devices = direct.get("hasTrustedDevices").and_then(Value::as_bool).unwrap_or(false)
+            || root.get("hasTrustedDevices").and_then(Value::as_bool).unwrap_or(false);
+        let push_bridge = has_trusted_devices
+            && direct.get("authInitialRoute").and_then(Value::as_str) == Some("auth/bridge/step")
+            && bridge.and_then(Value::as_object).is_some_and(|b| !b.is_empty());
+
         Self {
-            has_trusted_devices: direct.get("hasTrustedDevices").and_then(Value::as_bool).unwrap_or(false)
-                || root.get("hasTrustedDevices").and_then(Value::as_bool).unwrap_or(false),
+            has_trusted_devices,
+            push_bridge,
             phones,
             security_key_required: root.get("fsaChallenge").is_some_and(|v| !v.is_null())
                 || root.get("keyNames").is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty())),
@@ -183,12 +203,36 @@ mod tests {
     fn options_list_each_phone_once_with_its_details() {
         let options = TwoFactorOptions::from_boot_json(&parse_boot_args(PAGE).unwrap());
         assert!(options.has_trusted_devices);
+        assert!(options.push_bridge, "the page announces the bridge route");
         assert_eq!(options.phones.len(), 2, "id 1 appears twice and must be deduplicated");
         assert_eq!(options.phones[0].display.as_deref(), Some("+39 ••• ••• ••12"));
         assert_eq!(options.phones[0].non_fteu, Some(true));
         assert_eq!(options.phones[1].display.as_deref(), Some("•• 99"));
-        assert_eq!(options.preferred_method(), CodeMethod::TrustedDevice);
+        assert!(!options.device_code_available(), "no code shows up on the devices without the bridge handshake");
+        assert_eq!(options.preferred_method(), CodeMethod::Sms);
         assert!(options.can_use_sms());
+    }
+
+    #[test]
+    fn a_classic_account_still_gets_its_code_on_the_devices() {
+        let options = TwoFactorOptions::from_boot_json(&json!({
+            "direct": {"hasTrustedDevices": true, "authInitialRoute": "auth/twoSV",
+                       "twoSV": {"phoneNumberVerification": {"trustedPhoneNumber": {"id": 1}}}},
+        }));
+        assert!(options.has_trusted_devices && !options.push_bridge);
+        assert!(options.device_code_available());
+        assert_eq!(options.preferred_method(), CodeMethod::TrustedDevice);
+    }
+
+    #[test]
+    fn the_bridge_without_a_phone_falls_back_to_the_device_prompt() {
+        // Nothing better to offer; the caller explains the limitation.
+        let options = TwoFactorOptions::from_boot_json(&json!({
+            "direct": {"hasTrustedDevices": true, "authInitialRoute": "auth/bridge/step",
+                       "twoSV": {"bridgeInitiateData": {"x": 1}}},
+        }));
+        assert!(options.push_bridge && options.phones.is_empty());
+        assert_eq!(options.preferred_method(), CodeMethod::TrustedDevice);
     }
 
     #[test]

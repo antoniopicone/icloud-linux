@@ -28,10 +28,19 @@ cookie_dir: "~/.config/icloud-linux/cookies"
 crawl_mode: "lazy"
 
 # When file contents are downloaded. Only matters with crawl_mode: full.
+#   lazy       (default) — a file is fetched only when you open it or choose
+#                          "Download from iCloud" in the file manager.
 #   background — fetch every eligible file in the background once it is known.
-#   lazy       — fetch a file only when it is opened.
-# With crawl_mode: lazy, files are always fetched when opened.
-warmup_mode: "background"
+#                This puts a copy of the whole drive on the disk.
+# With crawl_mode: lazy, files are always fetched on demand.
+warmup_mode: "lazy"
+
+# Programs that walk the drive by themselves never trigger a download:
+# search indexers (Tracker, LocalSearch, Baloo) are turned away, and
+# thumbnailers get a preview only for files up to this many bytes. Bigger
+# files show a generic icon until you download them. 0 = no downloads for
+# previews at all.
+preview_max_bytes: 200000
 
 # What happens when a path changed both here and on iCloud. "copy" keeps the
 # local version as "<name>.local-conflict-<timestamp>" and uploads it as a new

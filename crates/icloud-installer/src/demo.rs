@@ -95,7 +95,7 @@ impl Backend for DemoBackend {
             },
         ];
         Ok(Box::new(DemoAuth {
-            options: TwoFactorOptions { has_trusted_devices: true, phones, security_key_required: false },
+            options: TwoFactorOptions { has_trusted_devices: true, phones, ..TwoFactorOptions::default() },
             pending: VecDeque::new(),
         }))
     }
@@ -114,6 +114,12 @@ impl Backend for DemoBackend {
         }
         if plan.show_sidebar_status {
             steps.push(step("Show activity in the Files sidebar", "appears next to iCloud".into()));
+        }
+        if plan.add_context_menu {
+            steps.push(step(
+                "Add \"Download from iCloud\" to the right-click menu",
+                "right-click a file, then Scripts".into(),
+            ));
         }
         steps
     }

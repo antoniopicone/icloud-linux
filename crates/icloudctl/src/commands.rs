@@ -64,6 +64,25 @@ pub fn run(command: Command, ctx: &mut Context<'_>) -> Result<()> {
         }
         Command::Sync { timeout, quiet } => sync(ctx, Duration::from_secs(timeout), quiet),
         Command::Hydrate { dry_run, verbose } => hydrate_command(ctx, dry_run, verbose),
+        Command::Download { paths, notify } => {
+            let from_file_manager = std::env::var("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS").ok();
+            download(ctx, paths, from_file_manager.as_deref(), notify)
+        }
+        Command::MenuInstall => {
+            let script = setup::install_menu_here(&ctx.layout)?;
+            ctx.ui.say(&format!(
+                "Added \"{}\" to the right-click menu of Files: right-click a file or folder in iCloud Drive, \
+                 then Scripts.\nInstalled {}",
+                setup::MENU_ENTRY,
+                script.display()
+            ));
+            Ok(())
+        }
+        Command::MenuUninstall => {
+            setup::remove_menu(&ctx.layout)?;
+            ctx.ui.say("Removed the right-click entry.");
+            Ok(())
+        }
         Command::Status => {
             ctx.ui.say(&setup::status_text(ctx.sys));
             Ok(())
@@ -144,6 +163,13 @@ fn quickstart(ctx: &mut Context<'_>, mount_dir: Option<PathBuf>) -> Result<()> {
     ctx.ui.say("\nStarting the service…");
     setup::start(&ctx.layout, ctx.sys)?;
     ctx.ui.say(&setup::status_text(ctx.sys));
+    match setup::install_menu_here(&ctx.layout) {
+        Ok(_) => ctx.ui.say(&format!(
+            "\nRight-click a file in iCloud Drive, then Scripts > {}, to keep it on this computer.",
+            setup::MENU_ENTRY
+        )),
+        Err(err) => ctx.ui.say(&format!("\n(The right-click entry was not added: {err})")),
+    }
     Ok(())
 }
 
@@ -177,17 +203,7 @@ fn hydrate_command(ctx: &mut Context<'_>, dry_run: bool, verbose: bool) -> Resul
         return Ok(());
     }
 
-    let mount = config
-        .mount_dir
-        .clone()
-        .or_else(|| setup::recorded_mount(&ctx.layout))
-        .unwrap_or_else(|| ctx.layout.default_mount());
-    if !setup::is_mounted(&mount) {
-        return Err(Error::Setup(format!(
-            "nothing is mounted at {}: start the service with `icloudctl start`",
-            mount.display()
-        )));
-    }
+    let mount = mounted_dir(ctx, &config)?;
 
     let cancel = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancel))?;
@@ -222,6 +238,147 @@ fn hydrate_command(ctx: &mut Context<'_>, dry_run: bool, verbose: bool) -> Resul
         "{} file(s) could not be downloaded; re-run to retry, or see `icloudctl logs`",
         report.failed.len()
     )))
+}
+
+/// Where iCloud Drive is mounted, provided it really is.
+fn mounted_dir(ctx: &Context<'_>, config: &Config) -> Result<PathBuf> {
+    let mount = config
+        .mount_dir
+        .clone()
+        .or_else(|| setup::recorded_mount(&ctx.layout))
+        .unwrap_or_else(|| ctx.layout.default_mount());
+    if setup::is_mounted(&mount) {
+        Ok(mount)
+    } else {
+        Err(Error::Setup(format!(
+            "nothing is mounted at {}: start the service with `icloudctl start`",
+            mount.display()
+        )))
+    }
+}
+
+/// A desktop notification, when asked for and possible. The right-click menu
+/// runs without a terminal, so this is the only way it can report anything.
+fn notify(enabled: bool, title: &str, body: &str) {
+    if enabled {
+        let _ = Process::new("notify-send")
+            .args(["--app-name=iCloud", "--icon=folder-download-symbolic", "--", title, body])
+            .status();
+    }
+}
+
+/// `icloudctl download`: fetch what the user picked, and only that.
+fn download(
+    ctx: &mut Context<'_>,
+    paths: Vec<PathBuf>,
+    from_file_manager: Option<&str>,
+    notify_user: bool,
+) -> Result<()> {
+    let outcome = download_selection(ctx, paths, from_file_manager, notify_user);
+    if let Err(err) = &outcome {
+        notify(notify_user, "iCloud download failed", &err.to_string());
+    }
+    outcome
+}
+
+fn download_selection(
+    ctx: &mut Context<'_>,
+    paths: Vec<PathBuf>,
+    from_file_manager: Option<&str>,
+    notify_user: bool,
+) -> Result<()> {
+    let picked: Vec<PathBuf> = if paths.is_empty() {
+        from_file_manager.unwrap_or_default().lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()
+    } else {
+        paths
+    };
+    if picked.is_empty() {
+        return Err(Error::Setup("nothing selected: give files or folders inside iCloud Drive".into()));
+    }
+
+    let config = load_config(ctx)?;
+    let mount = mounted_dir(ctx, &config)?;
+    let cwd = std::env::current_dir()?;
+    let selection = hydrate::resolve_selection(&mount, &picked, &cwd)?;
+    if selection.files.is_empty() {
+        return Err(Error::Setup(if selection.outside.is_empty() {
+            "there is no file to download in the selection".into()
+        } else {
+            format!("not inside iCloud Drive ({}): nothing to download", mount.display())
+        }));
+    }
+    for item in &selection.outside {
+        ctx.ui.say(&format!("Skipped {}: not inside iCloud Drive.", item.display()));
+    }
+
+    let plan = hydrate::plan_files(&config, &selection.files)?;
+    if plan.excluded > 0 {
+        ctx.ui.say(&format!("Skipped {} file(s) outside the synchronisation boundary (sync_paths).", plan.excluded));
+    }
+    if plan.pending.is_empty() {
+        ctx.ui.say("Already on this computer.");
+        notify(notify_user, "Already on this computer", &format!("{} file(s)", plan.already_local));
+        return Ok(());
+    }
+
+    let summary = format!("{} file(s), {}", plan.pending.len(), format_size(plan.pending_bytes()));
+    ctx.ui.say(&format!("Downloading {summary}…"));
+    notify(notify_user, "Downloading from iCloud", &summary);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register(signal, Arc::clone(&cancel))?;
+    }
+    let ui = &mut *ctx.ui;
+    let report = hydrate::run(&mount, &plan, &cancel, |path, progress| {
+        ui.say(&format!("  [{}/{}] {path}", progress.done, progress.total));
+    });
+
+    forget_failed_thumbnails(ctx, &mount, &plan, &report);
+
+    if report.failed.is_empty() && !report.interrupted {
+        ctx.ui.say(&format!("Downloaded {} file(s).", report.succeeded));
+        notify(notify_user, "Downloaded from iCloud", &summary);
+        return Ok(());
+    }
+    for (path, why) in report.failed.iter().take(10) {
+        ctx.ui.say(&format!("  failed: {path}: {why}"));
+    }
+    let message = if report.interrupted {
+        format!("interrupted after {} file(s); run it again to continue", report.succeeded)
+    } else {
+        format!(
+            "{} of {} file(s) could not be downloaded; see `icloudctl logs`",
+            report.failed.len(),
+            plan.pending.len()
+        )
+    };
+    Err(Error::Setup(message))
+}
+
+/// Files that were turned away from a thumbnailer while they were not
+/// downloaded are remembered as "failed"; now that they are here, let the file
+/// manager try again.
+fn forget_failed_thumbnails(
+    ctx: &Context<'_>,
+    mount: &std::path::Path,
+    plan: &hydrate::Plan,
+    report: &hydrate::Report,
+) {
+    let Some(cache_home) = ctx.layout.cache_dir.parent() else { return };
+    let real_mount = std::fs::canonicalize(mount).unwrap_or_else(|_| mount.to_owned());
+    let mut files = Vec::new();
+    for (path, _) in plan.pending.iter().filter(|(p, _)| !report.failed.iter().any(|(f, _)| f == p)) {
+        let relative = path.as_str().trim_start_matches('/');
+        files.push(mount.join(relative));
+        if real_mount != mount {
+            files.push(real_mount.join(relative));
+        }
+    }
+    let cleared = icloud_core::thumbnails::forget_failures(cache_home, &files);
+    if cleared > 0 {
+        tracing::debug!("cleared {cleared} thumbnail failure note(s)");
+    }
 }
 
 fn logs() -> Result<()> {
@@ -463,6 +620,29 @@ mod tests {
         let err = run_command(&dir, &sys, &mut Script::new(&[]), Command::Hydrate { dry_run: false, verbose: false })
             .unwrap_err();
         assert!(err.to_string().contains("nothing is mounted"), "{err}");
+    }
+
+    #[test]
+    fn download_needs_a_selection_and_a_mount() {
+        let (dir, sys) = ctx_parts();
+        let layout = Layout::under(dir.path());
+        Config::for_layout(&layout).save(&layout.config_file()).unwrap();
+
+        let none = Command::Download { paths: vec![], notify: false };
+        let err = run_command(&dir, &sys, &mut Script::new(&[]), none).unwrap_err();
+        assert!(err.to_string().contains("nothing selected"), "{err}");
+
+        let some = Command::Download { paths: vec!["/somewhere/file.pdf".into()], notify: false };
+        let err = run_command(&dir, &sys, &mut Script::new(&[]), some).unwrap_err();
+        assert!(err.to_string().contains("nothing is mounted"), "{err}");
+    }
+
+    #[test]
+    fn download_without_a_config_says_how_to_get_one() {
+        let (dir, sys) = ctx_parts();
+        let some = Command::Download { paths: vec!["f".into()], notify: false };
+        let err = run_command(&dir, &sys, &mut Script::new(&[]), some).unwrap_err();
+        assert!(err.to_string().contains("icloudctl init"), "{err}");
     }
 
     #[test]

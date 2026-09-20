@@ -19,7 +19,7 @@ use fuser::{
     OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
-use icloud_core::{Attr, DirItem, FileKind, FsCore, IcPath};
+use icloud_core::{Attr, DirItem, FileKind, FsCore, IcPath, ProcessReader};
 
 use crate::inodes::InodeTable;
 
@@ -262,9 +262,10 @@ impl Filesystem for IcloudFs {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let for_write = flags.acc_mode() != OpenAccMode::O_RDONLY;
-        match self.path_of(ino).and_then(|path| self.core.open(&path, for_write).map_err(errno)) {
+        let who = ProcessReader::new(req.pid());
+        match self.path_of(ino).and_then(|path| self.core.open_as(&path, for_write, &who).map_err(errno)) {
             Ok(()) => reply.opened(FileHandle(0), FopenFlags::empty()),
             Err(err) => reply.error(err),
         }
@@ -272,7 +273,7 @@ impl Filesystem for IcloudFs {
 
     fn read(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
         offset: u64,
@@ -281,7 +282,9 @@ impl Filesystem for IcloudFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let result = self.path_of(ino).and_then(|path| self.core.read(&path, offset, size as usize).map_err(errno));
+        let who = ProcessReader::new(req.pid());
+        let result =
+            self.path_of(ino).and_then(|path| self.core.read_as(&path, offset, size as usize, &who).map_err(errno));
         match result {
             Ok(data) => reply.data(&data),
             Err(err) => reply.error(err),

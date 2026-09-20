@@ -158,6 +158,7 @@ struct Widgets {
     lazy: gtk::CheckButton,
     indexer: gtk::CheckButton,
     sidebar: gtk::CheckButton,
+    menu: gtk::CheckButton,
     folder_message: gtk::Label,
     folder_busy: Busy,
     folder_next: gtk::Button,
@@ -306,8 +307,11 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     indexer.set_active(plan.keep_indexer_out);
     let sidebar = gtk::CheckButton::with_label("Show what iCloud is doing next to it in the Files sidebar");
     sidebar.set_active(plan.show_sidebar_status);
+    let menu = gtk::CheckButton::with_label("Add \"Download from iCloud\" to the right-click menu of Files");
+    menu.set_active(plan.add_context_menu);
     folder.append(&indexer);
     folder.append(&sidebar);
+    folder.append(&menu);
     let folder_message = label("", &["error-text"]);
     folder.append(&folder_message);
     let folder_busy = Busy::new();
@@ -432,6 +436,7 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
         lazy,
         indexer,
         sidebar,
+        menu,
         folder_message,
         folder_busy,
         folder_next,
@@ -569,6 +574,7 @@ impl Wizard {
             plan.crawl_mode = if w.lazy.is_active() { CrawlMode::Lazy } else { CrawlMode::Full };
             plan.keep_indexer_out = w.indexer.is_active();
             plan.show_sidebar_status = w.sidebar.is_active();
+            plan.add_context_menu = w.menu.is_active();
         }
         Self::show_note(&w.folder_message, "");
         w.folder_next.set_sensitive(false);
@@ -662,14 +668,22 @@ impl Wizard {
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         w.phones.set_model(Some(&gtk::StringList::new(&refs)));
         w.sms.set_sensitive(options.can_use_sms());
-        w.device.set_sensitive(options.has_trusted_devices || !options.can_use_sms());
-        let prefer_sms = !options.has_trusted_devices && options.can_use_sms();
+        w.device.set_sensitive(options.device_code_available() || !options.can_use_sms());
+        let prefer_sms = !options.device_code_available() && options.can_use_sms();
         w.sms.set_active(prefer_sms);
         w.device.set_active(!prefer_sms);
         w.code_entry.set_text("");
         w.verify_button.set_sensitive(false);
         w.verify_busy.hide();
-        Self::show_note(&w.verify_message, "");
+        Self::show_note(
+            &w.verify_message,
+            if options.push_bridge && options.can_use_sms() {
+                "For this account Apple does not show a code on your devices unless the app performs a push \
+                 handshake, which is not supported yet. Have the code sent by text message instead."
+            } else {
+                ""
+            },
+        );
         drop(options);
         self.update_delivery_widgets();
     }
@@ -841,11 +855,17 @@ impl Wizard {
         if all_ok {
             w.done_title.set_label("iCloud Drive is ready");
             let mut body = format!(
-                "Your files are in {mount}. Folders load as you open them and files download the first time you use them. \
-                 Changes you make there are uploaded automatically."
+                "Your files are in {mount}. Folders load as you open them; a file downloads when you open it or \
+                 choose \"Download from iCloud\" in its right-click menu. Changes you make there are uploaded \
+                 automatically."
             );
             if self.plan.borrow().show_sidebar_status {
                 body.push_str("\n\nThe Files sidebar shows what iCloud is doing next to its name.");
+            }
+            if self.plan.borrow().add_context_menu {
+                body.push_str(
+                    "\n\nRight-click a file or folder in iCloud Drive, then Scripts, to keep it on this computer.",
+                );
             }
             w.done_body.set_label(&body);
             w.open_folder.set_sensitive(true);
