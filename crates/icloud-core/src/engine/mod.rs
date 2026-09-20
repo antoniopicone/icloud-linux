@@ -94,7 +94,7 @@ macro_rules! numeric_field {
         }
     )*};
 }
-numeric_field!(u32, u64, usize, i64);
+numeric_field!(u32, u64, u128, usize, i64);
 impl<T: Field> Field for Option<T> {
     fn field(&self) -> Option<String> {
         self.as_ref().and_then(Field::field)
@@ -112,6 +112,10 @@ pub struct EngineConfig {
     pub refresh_interval: Duration,
     pub warmup_workers: usize,
     pub auto_sync: bool,
+    /// After a folder failed to list, how long before opening it triggers
+    /// another attempt. Without it every file manager probe of the folder
+    /// (they make dozens) would wait for the network again, one after another.
+    pub listing_retry_backoff: Duration,
 }
 
 impl EngineConfig {
@@ -125,6 +129,7 @@ impl EngineConfig {
             refresh_interval: config.refresh_interval(),
             warmup_workers: config.warmup_workers,
             auto_sync: config.auto_sync,
+            listing_retry_backoff: Duration::from_secs(15),
         }
     }
 }
@@ -161,6 +166,8 @@ struct Inner {
     upload_lock: Mutex<()>,
     scheduled: Mutex<HashSet<IcPath>>,
     attempts: Mutex<HashMap<IcPath, u32>>,
+    /// Folders whose last listing failed, when and why.
+    listing_failures: Mutex<HashMap<IcPath, (Instant, String)>>,
     planned: AtomicU64,
     completed: AtomicU64,
 
@@ -205,6 +212,7 @@ impl Engine {
                 upload_lock: Mutex::new(()),
                 scheduled: Mutex::new(HashSet::new()),
                 attempts: Mutex::new(HashMap::new()),
+                listing_failures: Mutex::new(HashMap::new()),
                 planned: AtomicU64::new(0),
                 completed: AtomicU64::new(0),
                 stop: Signal::default(),

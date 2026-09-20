@@ -22,6 +22,11 @@ pub const CLOUD_DOCS_ZONE: &str = "com.apple.CloudDocs";
 pub const ROOT_DRIVEWSID: &str = "FOLDER::com.apple.CloudDocs::root";
 const VALIDATE_COOKIE: &str = "X-APPLE-WEBAUTH-VALIDATE";
 
+/// Apple answers a folder listing in one piece, however many items it holds,
+/// and for a folder of thousands of items that can take much longer than an
+/// ordinary request. Giving up early would leave the folder unlisted.
+const LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// What a Drive item is. Anything that behaves like a directory is
 /// [`is_directory`](Self::is_directory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -215,22 +220,42 @@ impl HttpDrive {
     /// POST a JSON body under an explicit content type. Several Drive
     /// endpoints insist on `plain/text` for what is really JSON.
     fn post_body(&self, url: &str, content_type: &str, body: &Value) -> Result<Value> {
-        let request = self
+        self.post_body_within(url, content_type, body, None)
+    }
+
+    /// [`post_body`](Self::post_body) with a time limit other than the default.
+    fn post_body_within(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: &Value,
+        limit: Option<std::time::Duration>,
+    ) -> Result<Value> {
+        let mut request = self
             .session
             .post(url)
             .query(&self.params)
             .header(CONTENT_TYPE, content_type)
             .body(serde_json::to_vec(body)?);
+        if let Some(limit) = limit {
+            request = request.timeout(limit);
+        }
         let response = self.session.send(request)?;
         if response.is_empty() { Ok(Value::Null) } else { response.value() }
     }
 
-    fn item_details(&self, drivewsid: &str, share_id: Option<&Value>) -> Result<Value> {
+    fn item_details(
+        &self,
+        drivewsid: &str,
+        share_id: Option<&Value>,
+        limit: Option<std::time::Duration>,
+    ) -> Result<Value> {
         let mut item = json!({ "drivewsid": drivewsid, "partialData": false });
         if let Some(share) = share_id {
             item["shareID"] = share.clone();
         }
-        let reply = self.post_json(&self.service_url("retrieveItemDetailsInFolders"), &json!([item]))?;
+        let reply =
+            self.post_body_within(&self.service_url("retrieveItemDetailsInFolders"), CT_JSON, &json!([item]), limit)?;
         reply
             .as_array()
             .and_then(|items| items.first())
@@ -263,11 +288,11 @@ impl Drive for HttpDrive {
     }
 
     fn node(&self, drivewsid: &str, share_id: Option<&Value>) -> Result<Node> {
-        Node::from_json(&self.item_details(drivewsid, share_id)?)
+        Node::from_json(&self.item_details(drivewsid, share_id, None)?)
     }
 
     fn children(&self, folder: &Node) -> Result<Vec<Node>> {
-        let details = self.item_details(&folder.drivewsid, folder.share_id.as_ref())?;
+        let details = self.item_details(&folder.drivewsid, folder.share_id.as_ref(), Some(LISTING_TIMEOUT))?;
         let items = details.get("items").and_then(Value::as_array).ok_or_else(|| {
             let status = details.get("status").and_then(Value::as_str).unwrap_or("unknown");
             Error::Protocol(format!("no items in folder (status: {status})"))

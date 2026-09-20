@@ -235,7 +235,17 @@ impl FsCore {
         if Mirror::is_reserved(path) {
             return Err(Errno::NOENT);
         }
-        self.list_if_lazy(path);
+        if let Some(engine) = self.lazy_listing()
+            && let Err(err) = engine.list_directory(path, false)
+        {
+            tracing::warn!("could not list {path}: {err}");
+            // A folder listed before is still worth showing as it was. One that
+            // never was would look empty, which is untrue: say it failed, so
+            // the file manager shows an error instead of "this folder is empty".
+            if self.state.folder_listed_at(path).ok().flatten().is_none() {
+                return Err(Errno::IO);
+            }
+        }
         if !self.mirror.exists(path) {
             return Err(Errno::NOENT);
         }
@@ -694,6 +704,58 @@ mod tests {
         rig.drive.set_outage(Some(icloud_api::memory::Outage::Offline));
         rig.engine.state().mark_folder_listed_at(&IcPath::root(), None, 0).unwrap();
         assert_eq!(rig.names("/"), ["Docs", "Empty", "top.txt"], "stale but still shown");
+    }
+
+    #[test]
+    fn a_folder_that_could_not_be_listed_is_an_error_not_an_empty_folder() {
+        let rig = Rig::with(
+            SyncPolicy::unrestricted(),
+            FsOptions::default(),
+            EngineConfig {
+                auto_sync: false,
+                listing_retry_backoff: std::time::Duration::ZERO,
+                ..EngineConfig::default()
+            },
+        );
+        rig.drive.add_file("/", "top.txt", b"top content", 1_700_000_000);
+        rig.drive.add_folder("/", "Docs");
+        rig.drive.set_outage(Some(icloud_api::memory::Outage::Offline));
+        assert_eq!(rig.fs.readdir(&IcPath::root()).unwrap_err(), Errno::IO);
+        rig.drive.set_outage(None);
+        assert_eq!(rig.names("/"), ["Docs", "top.txt"], "and it lists normally once iCloud answers");
+    }
+
+    #[test]
+    fn a_failed_listing_is_not_retried_by_every_lookup_that_follows() {
+        let rig = Rig::with(
+            SyncPolicy::unrestricted(),
+            FsOptions::default(),
+            EngineConfig {
+                auto_sync: false,
+                listing_retry_backoff: std::time::Duration::from_secs(3600),
+                ..EngineConfig::default()
+            },
+        );
+        rig.drive.add_file("/", "f", b"x", 1);
+        rig.drive.set_outage(Some(icloud_api::memory::Outage::Offline));
+        assert_eq!(rig.fs.readdir(&IcPath::root()).unwrap_err(), Errno::IO);
+        let after_first = rig.drive.calls_matching("children:/");
+        assert_eq!(after_first, 1);
+        // A file manager probes for `.hidden`, `.directory`, thumbnails… each a miss.
+        for name in [".hidden", ".directory", "nope", "f"] {
+            assert_eq!(rig.fs.getattr(&p(&format!("/{name}"))).unwrap_err(), Errno::NOENT);
+        }
+        assert_eq!(rig.fs.readdir(&IcPath::root()).unwrap_err(), Errno::IO);
+        assert_eq!(rig.drive.calls_matching("children:/"), after_first, "no further network attempts");
+    }
+
+    #[test]
+    fn a_listed_folder_stays_visible_when_a_refresh_fails() {
+        let rig = Rig::seeded();
+        rig.names("/");
+        rig.drive.set_outage(Some(icloud_api::memory::Outage::Offline));
+        rig.engine.state().mark_folder_listed_at(&IcPath::root(), None, 0).unwrap();
+        assert_eq!(rig.names("/"), ["Docs", "Empty", "top.txt"]);
     }
 
     #[test]

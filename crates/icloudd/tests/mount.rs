@@ -475,3 +475,40 @@ fn downloading_a_chosen_folder_fetches_those_files_and_no_others() {
     let again = hydrate::plan_files(&config, &selection.files).unwrap();
     assert!(again.pending.is_empty() && again.already_local == 2);
 }
+
+#[test]
+fn opening_a_big_folder_the_way_a_file_manager_does_is_quick_and_downloads_nothing() {
+    let Some(m) = mounted() else { return };
+    m.drive.add_folder("/", "Desktop");
+    for i in 0..1800 {
+        let name = if i % 3 == 0 { format!("shot-{i}.png") } else { format!("doc-{i}.pdf") };
+        m.drive.add_file("/Desktop", &name, &vec![1u8; 50_000], 1);
+    }
+    let started = std::time::Instant::now();
+    let desktop = m.path("Desktop");
+    let listed = names(&desktop);
+    assert_eq!(listed.len(), 1800);
+
+    // Eight workers stat every entry, and probe for the names a file manager
+    // always asks about, as Nautilus does while it draws a folder.
+    let chunks: Vec<Vec<String>> = listed.chunks(listed.len() / 8 + 1).map(<[String]>::to_vec).collect();
+    let handles: Vec<_> = chunks
+        .into_iter()
+        .map(|chunk| {
+            let desktop = desktop.clone();
+            std::thread::spawn(move || {
+                for name in chunk {
+                    assert_eq!(fs::metadata(desktop.join(&name)).unwrap().len(), 50_000);
+                    let _ = fs::metadata(desktop.join(".hidden"));
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(10), "1800 entries took {took:?}");
+    assert_eq!(m.drive.calls_matching("children:/Desktop"), 1, "one listing, not one per probe");
+    assert_eq!(m.drive.calls_matching("open:"), 0, "looking at a folder downloads nothing");
+}

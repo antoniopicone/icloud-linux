@@ -1,7 +1,10 @@
 //! Learning what iCloud has: listing folders and reconciling the answers with
 //! the local mirror and database.
 
-use std::collections::{HashSet, VecDeque};
+use std::{
+    collections::{HashSet, VecDeque},
+    time::Instant,
+};
 
 use time::macros::format_description;
 
@@ -34,6 +37,9 @@ impl Engine {
                 return Ok(());
             }
         }
+        if !force && let Some(why) = self.recent_listing_failure(path) {
+            return Err(crate::Error::Setup(format!("listing {path} failed a moment ago: {why}")));
+        }
 
         let (folder, drivewsid) = if path.is_root() {
             (Node::root(), None)
@@ -57,15 +63,28 @@ impl Engine {
         };
 
         sync_event!(info, "list-directory-start", path = path);
+        let started = Instant::now();
         let children = match inner.drive.children(&folder) {
             Ok(children) => children,
             Err(err) => {
                 let err = crate::Error::from(err);
                 self.note_failure(&err);
-                tracing::error!("could not list {path} from iCloud: {err}");
+                tracing::error!(
+                    "could not list {path} from iCloud after {:.1}s: {err}",
+                    started.elapsed().as_secs_f32()
+                );
+                lock(&inner.listing_failures).insert(path.clone(), (Instant::now(), err.to_string()));
                 return Err(err);
             }
         };
+        let fetched = started.elapsed();
+        if fetched.as_secs() >= 10 {
+            tracing::warn!(
+                "iCloud took {:.1}s to list {path} ({} entries); a folder this size is slow to open the first time",
+                fetched.as_secs_f32(),
+                children.len()
+            );
+        }
 
         let mut seen: HashSet<&str> = HashSet::new();
         for child in &children {
@@ -92,8 +111,30 @@ impl Engine {
         }
 
         inner.state.mark_folder_listed(path, drivewsid.as_deref())?;
-        sync_event!(info, "list-directory-complete", path = path, entries = children.len());
+        lock(&inner.listing_failures).remove(path);
+        sync_event!(
+            info,
+            "list-directory-complete",
+            path = path,
+            entries = children.len(),
+            fetch_ms = fetched.as_millis(),
+            apply_ms = started.elapsed().saturating_sub(fetched).as_millis()
+        );
         Ok(())
+    }
+
+    /// Why `path` failed to list a moment ago, if it did.
+    fn recent_listing_failure(&self, path: &IcPath) -> Option<String> {
+        let backoff = self.inner.config.listing_retry_backoff;
+        let mut failures = lock(&self.inner.listing_failures);
+        match failures.get(path) {
+            Some((when, why)) if when.elapsed() < backoff => Some(why.clone()),
+            Some(_) => {
+                failures.remove(path);
+                None
+            }
+            None => None,
+        }
     }
 
     /// Reconcile one item iCloud reported with what is stored locally.
@@ -441,7 +482,14 @@ mod tests {
     use super::{testing::Rig, *};
 
     fn seeded() -> Rig {
-        let rig = Rig::new();
+        seeded_with_backoff(EngineConfig::default().listing_retry_backoff)
+    }
+
+    fn seeded_with_backoff(backoff: Duration) -> Rig {
+        let rig = Rig::with(
+            SyncPolicy::unrestricted(),
+            EngineConfig { auto_sync: false, listing_retry_backoff: backoff, ..EngineConfig::default() },
+        );
         rig.drive.add_file("/", "top.txt", b"top", 100);
         rig.drive.add_folder("/", "Docs");
         rig.drive.add_file("/Docs", "a.txt", b"alpha", 200);
@@ -506,11 +554,28 @@ mod tests {
 
     #[test]
     fn a_failed_listing_reports_the_error_and_leaves_no_marker() {
-        let rig = seeded();
+        let rig = seeded_with_backoff(Duration::ZERO);
         rig.drive.set_outage(Some(Outage::Offline));
         assert!(rig.engine.list_directory(&IcPath::root(), false).is_err());
         assert!(rig.engine.inner.state.folder_listed_at(&IcPath::root()).unwrap().is_none());
         rig.drive.set_outage(None);
+        rig.engine.list_directory(&IcPath::root(), false).unwrap();
+        assert!(rig.entry("/top.txt").is_some());
+    }
+
+    #[test]
+    fn after_a_failure_the_network_is_left_alone_until_the_backoff_is_over() {
+        let rig = seeded_with_backoff(Duration::from_secs(3600));
+        rig.drive.set_outage(Some(Outage::Offline));
+        assert!(rig.engine.list_directory(&IcPath::root(), false).is_err());
+        rig.drive.set_outage(None);
+
+        let err = rig.engine.list_directory(&IcPath::root(), false).unwrap_err();
+        assert!(err.to_string().contains("failed a moment ago"), "{err}");
+        assert_eq!(rig.drive.calls_matching("children:/"), 1, "the second attempt never reached iCloud");
+
+        // An explicit refresh ignores the backoff and clears it on success.
+        rig.engine.list_directory(&IcPath::root(), true).unwrap();
         rig.engine.list_directory(&IcPath::root(), false).unwrap();
         assert!(rig.entry("/top.txt").is_some());
     }
