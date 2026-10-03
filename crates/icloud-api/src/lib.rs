@@ -4,13 +4,19 @@
 //! * [`Session`]: cookies, Apple's session headers, error normalisation.
 //! * [`Client`]: sign in, two-factor, trust, and hand out services.
 //! * [`drive`]: the [`Drive`] trait and its HTTP implementation.
+//! * [`cloudkit`]: the `CloudKit` database client behind Reminders (and, later,
+//!   Notes and Photos).
+//! * [`reminders`]: iCloud Reminders: lists, reminders, incremental changes
+//!   and writes.
 //!
-//! Notes, Photos and the like would arrive as further service modules next to
-//! `drive`, obtained from the same [`Client`].
+//! Every service is obtained from the same [`Client`], so one sign-in serves
+//! them all.
 
 pub mod client;
+pub mod cloudkit;
 pub mod drive;
 pub mod error;
+pub mod reminders;
 pub mod session;
 pub mod srp;
 pub mod twofactor;
@@ -21,6 +27,7 @@ pub mod memory;
 pub use client::{AccountInfo, Client, ClientConfig, Endpoints, LoginStatus};
 pub use drive::{DeleteMode, Drive, HttpDrive, Node, NodeKind};
 pub use error::{Error, Result};
+pub use reminders::RemindersService;
 pub use session::Session;
 pub use twofactor::{CodeMethod, TrustedPhone, TwoFactorOptions};
 

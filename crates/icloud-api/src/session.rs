@@ -152,6 +152,11 @@ impl ApiResponse {
         self.body.is_empty()
     }
 
+    /// The raw body, for binary payloads such as `CloudKit` assets.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.body
+    }
+
     fn is_json(&self) -> bool {
         self.header("content-type")
             .and_then(|ct| ct.split(';').next())
@@ -321,7 +326,7 @@ impl Session {
     }
 
     /// Turn Apple's status and body conventions into a `Result`.
-    fn check(&self, response: &ApiResponse) -> Result<()> {
+    pub(crate) fn check(&self, response: &ApiResponse) -> Result<()> {
         if !(200..300).contains(&response.status) {
             let json_or_auth = response.is_json() || matches!(response.status, 409 | 421 | 450 | 500);
             return Err(if json_or_auth {

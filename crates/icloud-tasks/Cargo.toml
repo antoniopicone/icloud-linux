@@ -1,0 +1,21 @@
+[package]
+name = "icloud-tasks"
+description = "iCloud Reminders as iCalendar VTODO, for syncing them with a CalDAV task list"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+icloud-api = { version = "0.2.0", path = "../icloud-api" }
+jiff = "0.2.37"
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+time = "0.3.55"
+tracing = "0.1.44"
+
+[dev-dependencies]
+time = { version = "0.3.55", features = ["macros"] }

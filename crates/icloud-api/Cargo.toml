@@ -1,6 +1,6 @@
 [package]
 name = "icloud-api"
-description = "Blocking client for the iCloud web services used by icloud-linux (auth, 2FA, Drive)"
+description = "Blocking client for the iCloud web services used by icloud-linux (auth, 2FA, Drive, Reminders)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,6 +17,8 @@ testing = []
 [dependencies]
 base64 = "0.23.1"
 cookie_store = "0.22.1"
+flate2 = "1.1.10"
+prost = "0.14.4"
 mime_guess = "2.0.5"
 num-bigint = "0.5.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls", "cookies", "multipart", "query", "form"] }
@@ -33,3 +35,4 @@ url = "2.5.8"
 [dev-dependencies]
 httpmock = "0.8.3"
 tempfile = "3.27.0"
+time = { version = "0.3.55", features = ["macros", "parsing", "formatting"] }

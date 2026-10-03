@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/icloud-api",
+    "crates/icloud-tasks",
     "crates/icloud-core",
     "crates/icloudd",
     "crates/icloudctl",

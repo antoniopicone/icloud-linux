@@ -1,0 +1,983 @@
+{
+ "lists": [
+  {
+   "id": "List/L1",
+   "title": "Spesa",
+   "color": "{\"ckSymbolicColorName\":\"orange\"}",
+   "count": 2,
+   "badge_emblem": null,
+   "sorting_style": null,
+   "is_group": false,
+   "deleted": false,
+   "reminder_ids": [
+    "AAAA-1",
+    "BBBB-2"
+   ],
+   "guid": null,
+   "record_change_tag": "tag-1"
+  }
+ ],
+ "list_reminders": [
+  {
+   "id": "Reminder/AAAA-1",
+   "list_id": "List/L1",
+   "title": "Comprare il latte",
+   "desc": "Intero, 2 litri",
+   "completed": false,
+   "completed_date": null,
+   "due_date": "2026-09-22T18:00:00Z",
+   "start_date": null,
+   "priority": 1,
+   "flagged": true,
+   "all_day": false,
+   "deleted": false,
+   "time_zone": "Europe/Rome",
+   "alarm_ids": [
+    "X1"
+   ],
+   "hashtag_ids": [
+    "H1"
+   ],
+   "attachment_ids": [],
+   "recurrence_rule_ids": [],
+   "parent_reminder_id": "Reminder/P0",
+   "created": "2026-05-28T20:26:40Z",
+   "modified": "2026-09-10T00:26:40Z",
+   "record_change_tag": "tag-1"
+  }
+ ],
+ "sync_cursor": "TOK-Q",
+ "changes": [
+  {
+   "type": "updated",
+   "reminder_id": "Reminder/AAAA-1",
+   "reminder": {
+    "id": "Reminder/AAAA-1",
+    "list_id": "List/L1",
+    "title": "Comprare il latte",
+    "desc": "Intero, 2 litri",
+    "completed": false,
+    "completed_date": null,
+    "due_date": "2026-09-22T18:00:00Z",
+    "start_date": null,
+    "priority": 1,
+    "flagged": true,
+    "all_day": false,
+    "deleted": false,
+    "time_zone": "Europe/Rome",
+    "alarm_ids": [
+     "X1"
+    ],
+    "hashtag_ids": [
+     "H1"
+    ],
+    "attachment_ids": [],
+    "recurrence_rule_ids": [],
+    "parent_reminder_id": "Reminder/P0",
+    "created": "2026-05-28T20:26:40Z",
+    "modified": "2026-09-10T00:26:40Z",
+    "record_change_tag": "tag-1"
+   }
+  },
+  {
+   "type": "deleted",
+   "reminder_id": "Reminder/GONE",
+   "reminder": null
+  }
+ ],
+ "created_id": "Reminder/00000000-0000-4000-8000-000000000001",
+ "calls": [
+  {
+   "path": "/database/1/com.apple.reminders/production/private/changes/zone",
+   "query": {
+    "remapEnums": "true",
+    "getCurrentSyncToken": "true",
+    "clientBuildNumber": "B",
+    "clientMasteringNumber": "M",
+    "clientId": "CID",
+    "dsid": "42"
+   },
+   "body": {
+    "zones": [
+     {
+      "zoneID": {
+       "zoneName": "Reminders",
+       "zoneType": "REGULAR_CUSTOM_ZONE"
+      },
+      "desiredRecordTypes": [
+       "List"
+      ]
+     }
+    ]
+   },
+   "reply": {
+    "zones": [
+     {
+      "zoneID": {
+       "zoneName": "Reminders"
+      },
+      "records": [
+       {
+        "recordName": "List/L1",
+        "recordType": "List",
+        "fields": {
+         "Name": {
+          "type": "STRING",
+          "value": "Spesa"
+         },
+         "Color": {
+          "type": "STRING",
+          "value": "{\"ckSymbolicColorName\":\"orange\"}"
+         },
+         "ReminderIDs": {
+          "type": "STRING",
+          "value": "[\"Reminder/AAAA-1\",\"BBBB-2\"]"
+         },
+         "Count": {
+          "type": "INT64",
+          "value": 0
+         },
+         "Deleted": {
+          "type": "INT64",
+          "value": 0
+         }
+        },
+        "recordChangeTag": "tag-1"
+       }
+      ],
+      "syncToken": "TOK-2",
+      "moreComing": false
+     }
+    ]
+   }
+  },
+  {
+   "path": "/database/1/com.apple.reminders/production/private/records/query",
+   "query": {
+    "remapEnums": "true",
+    "getCurrentSyncToken": "true",
+    "clientBuildNumber": "B",
+    "clientMasteringNumber": "M",
+    "clientId": "CID",
+    "dsid": "42"
+   },
+   "body": {
+    "query": {
+     "recordType": "reminderList",
+     "filterBy": [
+      {
+       "comparator": "EQUALS",
+       "fieldName": "List",
+       "fieldValue": {
+        "type": "REFERENCE",
+        "value": {
+         "recordName": "List/L1",
+         "action": "VALIDATE"
+        }
+       }
+      },
+      {
+       "comparator": "EQUALS",
+       "fieldName": "includeCompleted",
+       "fieldValue": {
+        "type": "INT64",
+        "value": 1
+       }
+      },
+      {
+       "comparator": "EQUALS",
+       "fieldName": "LookupValidatingReference",
+       "fieldValue": {
+        "type": "INT64",
+        "value": 1
+       }
+      }
+     ]
+    },
+    "zoneID": {
+     "zoneName": "Reminders",
+     "zoneType": "REGULAR_CUSTOM_ZONE"
+    },
+    "resultsLimit": 200
+   },
+   "reply": {
+    "records": [
+     {
+      "recordName": "Reminder/AAAA-1",
+      "recordType": "Reminder",
+      "fields": {
+       "TitleDocument": {
+        "type": "STRING",
+        "value": "eJzjYBAq52AQYJAqFBJ0zs8tKEosSlXIzFHISSwpSZUS4GIBSQKlwbQGI1iEESgiKAWmNZikxLg4gHL/gYAfqA7OVpLhkuISuJJ96ol0e9rB3tL3j2Mmuh4WYuIQBGJGLSANAP81HJY="
+       },
+       "NotesDocument": {
+        "type": "ENCRYPTED_BYTES",
+        "value": "eJzjYBAq5WAQYJDKF+L3zCtJLcrXUTBSyMksKcqUEuBiAUkBJcG0BiNYhBEowi8FpjWYpMS4OIBy/4GAH6gOzlaS4ZLiEriSfeqJdHvawd7S949jJroeFmLi4AdiRi0gDQB3jhtV"
+       },
+       "List": {
+        "type": "REFERENCE",
+        "value": {
+         "recordName": "List/L1",
+         "action": "VALIDATE"
+        }
+       },
+       "Completed": {
+        "type": "INT64",
+        "value": 0
+       },
+       "Priority": {
+        "type": "INT64",
+        "value": 1
+       },
+       "Flagged": {
+        "type": "INT64",
+        "value": 1
+       },
+       "AllDay": {
+        "type": "INT64",
+        "value": 0
+       },
+       "DueDate": {
+        "type": "TIMESTAMP",
+        "value": 1790100000000
+       },
+       "CompletionDate": {
+        "type": "TIMESTAMP",
+        "value": -62135596800000
+       },
+       "CreationDate": {
+        "type": "TIMESTAMP",
+        "value": 1780000000000
+       },
+       "LastModifiedDate": {
+        "type": "TIMESTAMP",
+        "value": 1789000000000
+       },
+       "TimeZone": {
+        "type": "STRING",
+        "value": "Europe/Rome"
+       },
+       "AlarmIDs": {
+        "type": "STRING_LIST",
+        "value": [
+         "Alarm/X1"
+        ]
+       },
+       "HashtagIDs": {
+        "type": "STRING_LIST",
+        "value": [
+         "H1"
+        ]
+       },
+       "ParentReminder": {
+        "type": "REFERENCE",
+        "value": {
+         "recordName": "Reminder/P0"
+        }
+       }
+      },
+      "recordChangeTag": "tag-1"
+     }
+    ],
+    "syncToken": "TOK-Q"
+   }
+  },
+  {
+   "path": "/database/1/com.apple.reminders/production/private/records/query",
+   "query": {
+    "remapEnums": "true",
+    "getCurrentSyncToken": "true",
+    "clientBuildNumber": "B",
+    "clientMasteringNumber": "M",
+    "clientId": "CID",
+    "dsid": "42"
+   },
+   "body": {
+    "query": {
+     "recordType": "reminderList"
+    },
+    "zoneID": {
+     "zoneName": "Reminders",
+     "zoneType": "REGULAR_CUSTOM_ZONE"
+    },
+    "resultsLimit": 1
+   },
+   "reply": {
+    "records": [
+     {
+      "recordName": "Reminder/AAAA-1",
+      "recordType": "Reminder",
+      "fields": {
+       "TitleDocument": {
+        "type": "STRING",
+        "value": "eJzjYBAq52AQYJAqFBJ0zs8tKEosSlXIzFHISSwpSZUS4GIBSQKlwbQGI1iEESgiKAWmNZikxLg4gHL/gYAfqA7OVpLhkuISuJJ96ol0e9rB3tL3j2Mmuh4WYuIQBGJGLSANAP81HJY="
+       },
+       "NotesDocument": {
+        "type": "ENCRYPTED_BYTES",
+        "value": "eJzjYBAq5WAQYJDKF+L3zCtJLcrXUTBSyMksKcqUEuBiAUkBJcG0BiNYhBEowi8FpjWYpMS4OIBy/4GAH6gOzlaS4ZLiEriSfeqJdHvawd7S949jJroeFmLi4AdiRi0gDQB3jhtV"
+       },
+       "List": {
+        "type": "REFERENCE",
+        "value": {
+         "recordName": "List/L1",
+         "action": "VALIDATE"
+        }
+       },
+       "Completed": {
+        "type": "INT64",
+        "value": 0
+       },
+       "Priority": {
+        "type": "INT64",
+        "value": 1
+       },
+       "Flagged": {
+        "type": "INT64",
+        "value": 1
+       },
+       "AllDay": {
+        "type": "INT64",
+        "value": 0
+       },
+       "DueDate": {
+        "type": "TIMESTAMP",
+        "value": 1790100000000
+       },
+       "CompletionDate": {
+        "type": "TIMESTAMP",
+        "value": -62135596800000
+       },
+       "CreationDate": {
+        "type": "TIMESTAMP",
+        "value": 1780000000000
+       },
+       "LastModifiedDate": {
+        "type": "TIMESTAMP",
+        "value": 1789000000000
+       },
+       "TimeZone": {
+        "type": "STRING",
+        "value": "Europe/Rome"
+       },
+       "AlarmIDs": {
+        "type": "STRING_LIST",
+        "value": [
+         "Alarm/X1"
+        ]
+       },
+       "HashtagIDs": {
+        "type": "STRING_LIST",
+        "value": [
+         "H1"
+        ]
+       },
+       "ParentReminder": {
+        "type": "REFERENCE",
+        "value": {
+         "recordName": "Reminder/P0"
+        }
+       }
+      },
+      "recordChangeTag": "tag-1"
+     }
+    ],
+    "syncToken": "TOK-Q"
+   }
+  },
+  {
+   "path": "/database/1/com.apple.reminders/production/private/changes/zone",
+   "query": {
+    "remapEnums": "true",
+    "getCurrentSyncToken": "true",
+    "clientBuildNumber": "B",
+    "clientMasteringNumber": "M",
+    "clientId": "CID",
+    "dsid": "42"
+   },
+   "body": {
+    "zones": [
+     {
+      "zoneID": {
+       "zoneName": "Reminders",
+       "zoneType": "REGULAR_CUSTOM_ZONE"
+      },
+      "desiredRecordTypes": [
+       "Reminder"
+      ],
+      "syncToken": "TOK-1",
+      "reverse": false
+     }
+    ]
+   },
+   "reply": {
+    "zones": [
+     {
+      "zoneID": {
+       "zoneName": "Reminders"
+      },
+      "records": [
+       {
+        "recordName": "Reminder/AAAA-1",
+        "recordType": "Reminder",
+        "fields": {
+         "TitleDocument": {
+          "type": "STRING",
+          "value": "eJzjYBAq52AQYJAqFBJ0zs8tKEosSlXIzFHISSwpSZUS4GIBSQKlwbQGI1iEESgiKAWmNZikxLg4gHL/gYAfqA7OVpLhkuISuJJ96ol0e9rB3tL3j2Mmuh4WYuIQBGJGLSANAP81HJY="
+         },
+         "NotesDocument": {
+          "type": "ENCRYPTED_BYTES",
+          "value": "eJzjYBAq5WAQYJDKF+L3zCtJLcrXUTBSyMksKcqUEuBiAUkBJcG0BiNYhBEowi8FpjWYpMS4OIBy/4GAH6gOzlaS4ZLiEriSfeqJdHvawd7S949jJroeFmLi4AdiRi0gDQB3jhtV"
+         },
+         "List": {
+          "type": "REFERENCE",
+          "value": {
+           "recordName": "List/L1",
+           "action": "VALIDATE"
+          }
+         },
+         "Completed": {
+          "type": "INT64",
+          "value": 0
+         },
+         "Priority": {
+          "type": "INT64",
+          "value": 1
+         },
+         "Flagged": {
+          "type": "INT64",
+          "value": 1
+         },
+         "AllDay": {
+          "type": "INT64",
+          "value": 0
+         },
+         "DueDate": {
+          "type": "TIMESTAMP",
+          "value": 1790100000000
+         },
+         "CompletionDate": {
+          "type": "TIMESTAMP",
+          "value": -62135596800000
+         },
+         "CreationDate": {
+          "type": "TIMESTAMP",
+          "value": 1780000000000
+         },
+         "LastModifiedDate": {
+          "type": "TIMESTAMP",
+          "value": 1789000000000
+         },
+         "TimeZone": {
+          "type": "STRING",
+          "value": "Europe/Rome"
+         },
+         "AlarmIDs": {
+          "type": "STRING_LIST",
+          "value": [
+           "Alarm/X1"
+          ]
+         },
+         "HashtagIDs": {
+          "type": "STRING_LIST",
+          "value": [
+           "H1"
+          ]
+         },
+         "ParentReminder": {
+          "type": "REFERENCE",
+          "value": {
+           "recordName": "Reminder/P0"
+          }
+         }
+        },
+        "recordChangeTag": "tag-1"
+       },
+       {
+        "recordName": "Reminder/GONE",
+        "deleted": true
+       }
+      ],
+      "syncToken": "TOK-2",
+      "moreComing": false
+     }
+    ]
+   }
+  },
+  {
+   "path": "/database/1/com.apple.reminders/production/private/records/modify",
+   "query": {
+    "remapEnums": "true",
+    "getCurrentSyncToken": "true",
+    "clientBuildNumber": "B",
+    "clientMasteringNumber": "M",
+    "clientId": "CID",
+    "dsid": "42"
+   },
+   "body": {
+    "operations": [
+     {
+      "operationType": "create",
+      "record": {
+       "recordName": "Reminder/00000000-0000-4000-8000-000000000001",
+       "recordType": "Reminder",
+       "fields": {
+        "AllDay": {
+         "type": "INT64",
+         "value": 0
+        },
+        "Completed": {
+         "type": "INT64",
+         "value": 0
+        },
+        "CompletionDate": {
+         "type": "TIMESTAMP"
+        },
+        "CreationDate": {
+         "type": "TIMESTAMP",
+         "value": 1790000000123
+        },
+        "Deleted": {
+         "type": "INT64",
+         "value": 0
+        },
+        "Flagged": {
+         "type": "INT64",
+         "value": 1
+        },
+        "Imported": {
+         "type": "INT64",
+         "value": 0
+        },
+        "LastModifiedDate": {
+         "type": "TIMESTAMP",
+         "value": 1790000000123
+        },
+        "List": {
+         "type": "REFERENCE",
+         "value": {
+          "recordName": "List/L1",
+          "action": "VALIDATE"
+         }
+        },
+        "NotesDocument": {
+         "type": "STRING",
+         "value": "eJzjYBAq5WAQYJDKF+L3zCtJLcrXUTBSyMksKcqUEuBiAUkBJcG0BiNYhBEowi8FpjWYpMS4OIBy/4GAH6gOzlaS4ZLiEriSfeqJdHvawd7S949jJroeFmLi4AdiRi0gDQB3jhtV"
+        },
+        "Priority": {
+         "type": "INT64",
+         "value": 1
+        },
+        "ResolutionTokenMap": {
+         "type": "STRING",
+         "value": "{\"map\":{\"allDay\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000002\"},\"titleDocument\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000003\"},\"notesDocument\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000004\"},\"parentReminder\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000005\"},\"priority\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000006\"},\"icsDisplayOrder\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000007\"},\"creationDate\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000008\"},\"list\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000009\"},\"flagged\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000000A\"},\"completed\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000000B\"},\"completionDate\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000000C\"},\"lastModifiedDate\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000000D\"},\"recurrenceRuleIDs\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000000E\"},\"dueDate\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000000F\"},\"timeZone\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000010\"}}}"
+        },
+        "TitleDocument": {
+         "type": "STRING",
+         "value": "eJzjYBAq52AQYJAqFBJ0zs8tKEosSlXIzFHISSwpSZUS4GIBSQKlwbQGI1iEESgiKAWmNZikxLg4gHL/gYAfqA7OVpLhkuISuJJ96ol0e9rB3tL3j2Mmuh4WYuIQBGJGLSANAP81HJY="
+        },
+        "DueDate": {
+         "type": "TIMESTAMP",
+         "value": 1790157600000
+        },
+        "TimeZone": {
+         "type": "STRING",
+         "value": "Europe/Rome"
+        },
+        "ParentReminder": {
+         "type": "REFERENCE",
+         "value": {
+          "recordName": "Reminder/P0",
+          "action": "VALIDATE"
+         }
+        }
+       },
+       "pluginFields": {},
+       "parent": {
+        "recordName": "List/L1"
+       }
+      }
+     }
+    ],
+    "zoneID": {
+     "zoneName": "Reminders",
+     "zoneType": "REGULAR_CUSTOM_ZONE"
+    }
+   },
+   "reply": {
+    "records": [
+     {
+      "recordName": "Reminder/00000000-0000-4000-8000-000000000001",
+      "recordType": "Reminder",
+      "fields": {},
+      "recordChangeTag": "tag-NEW"
+     }
+    ]
+   }
+  },
+  {
+   "path": "/database/1/com.apple.reminders/production/private/records/lookup",
+   "query": {
+    "remapEnums": "true",
+    "getCurrentSyncToken": "true",
+    "clientBuildNumber": "B",
+    "clientMasteringNumber": "M",
+    "clientId": "CID",
+    "dsid": "42"
+   },
+   "body": {
+    "records": [
+     {
+      "recordName": "Reminder/00000000-0000-4000-8000-000000000001"
+     }
+    ],
+    "zoneID": {
+     "zoneName": "Reminders",
+     "zoneType": "REGULAR_CUSTOM_ZONE"
+    }
+   },
+   "reply": {
+    "records": [
+     {
+      "recordName": "Reminder/00000000-0000-4000-8000-000000000001",
+      "recordType": "Reminder",
+      "fields": {
+       "TitleDocument": {
+        "type": "STRING",
+        "value": "eJzjYBAq52AQYJAqFBJ0zs8tKEosSlXIzFHISSwpSZUS4GIBSQKlwbQGI1iEESgiKAWmNZikxLg4gHL/gYAfqA7OVpLhkuISuJJ96ol0e9rB3tL3j2Mmuh4WYuIQBGJGLSANAP81HJY="
+       },
+       "NotesDocument": {
+        "type": "ENCRYPTED_BYTES",
+        "value": "eJzjYBAq5WAQYJDKF+L3zCtJLcrXUTBSyMksKcqUEuBiAUkBJcG0BiNYhBEowi8FpjWYpMS4OIBy/4GAH6gOzlaS4ZLiEriSfeqJdHvawd7S949jJroeFmLi4AdiRi0gDQB3jhtV"
+       },
+       "List": {
+        "type": "REFERENCE",
+        "value": {
+         "recordName": "List/L1",
+         "action": "VALIDATE"
+        }
+       },
+       "Completed": {
+        "type": "INT64",
+        "value": 0
+       },
+       "Priority": {
+        "type": "INT64",
+        "value": 1
+       },
+       "Flagged": {
+        "type": "INT64",
+        "value": 1
+       },
+       "AllDay": {
+        "type": "INT64",
+        "value": 0
+       },
+       "DueDate": {
+        "type": "TIMESTAMP",
+        "value": 1790100000000
+       },
+       "CompletionDate": {
+        "type": "TIMESTAMP",
+        "value": -62135596800000
+       },
+       "CreationDate": {
+        "type": "TIMESTAMP",
+        "value": 1780000000000
+       },
+       "LastModifiedDate": {
+        "type": "TIMESTAMP",
+        "value": 1789000000000
+       },
+       "TimeZone": {
+        "type": "STRING",
+        "value": "Europe/Rome"
+       },
+       "AlarmIDs": {
+        "type": "STRING_LIST",
+        "value": [
+         "Alarm/X1"
+        ]
+       },
+       "HashtagIDs": {
+        "type": "STRING_LIST",
+        "value": [
+         "H1"
+        ]
+       },
+       "ParentReminder": {
+        "type": "REFERENCE",
+        "value": {
+         "recordName": "Reminder/P0"
+        }
+       }
+      },
+      "recordChangeTag": "tag-1"
+     }
+    ]
+   }
+  },
+  {
+   "path": "/database/1/com.apple.reminders/production/private/records/lookup",
+   "query": {
+    "remapEnums": "true",
+    "getCurrentSyncToken": "true",
+    "clientBuildNumber": "B",
+    "clientMasteringNumber": "M",
+    "clientId": "CID",
+    "dsid": "42"
+   },
+   "body": {
+    "records": [
+     {
+      "recordName": "Reminder/AAAA-1"
+     }
+    ],
+    "zoneID": {
+     "zoneName": "Reminders",
+     "zoneType": "REGULAR_CUSTOM_ZONE"
+    }
+   },
+   "reply": {
+    "records": [
+     {
+      "recordName": "Reminder/AAAA-1",
+      "recordType": "Reminder",
+      "fields": {
+       "TitleDocument": {
+        "type": "STRING",
+        "value": "eJzjYBAq52AQYJAqFBJ0zs8tKEosSlXIzFHISSwpSZUS4GIBSQKlwbQGI1iEESgiKAWmNZikxLg4gHL/gYAfqA7OVpLhkuISuJJ96ol0e9rB3tL3j2Mmuh4WYuIQBGJGLSANAP81HJY="
+       },
+       "NotesDocument": {
+        "type": "ENCRYPTED_BYTES",
+        "value": "eJzjYBAq5WAQYJDKF+L3zCtJLcrXUTBSyMksKcqUEuBiAUkBJcG0BiNYhBEowi8FpjWYpMS4OIBy/4GAH6gOzlaS4ZLiEriSfeqJdHvawd7S949jJroeFmLi4AdiRi0gDQB3jhtV"
+       },
+       "List": {
+        "type": "REFERENCE",
+        "value": {
+         "recordName": "List/L1",
+         "action": "VALIDATE"
+        }
+       },
+       "Completed": {
+        "type": "INT64",
+        "value": 0
+       },
+       "Priority": {
+        "type": "INT64",
+        "value": 1
+       },
+       "Flagged": {
+        "type": "INT64",
+        "value": 1
+       },
+       "AllDay": {
+        "type": "INT64",
+        "value": 0
+       },
+       "DueDate": {
+        "type": "TIMESTAMP",
+        "value": 1790100000000
+       },
+       "CompletionDate": {
+        "type": "TIMESTAMP",
+        "value": -62135596800000
+       },
+       "CreationDate": {
+        "type": "TIMESTAMP",
+        "value": 1780000000000
+       },
+       "LastModifiedDate": {
+        "type": "TIMESTAMP",
+        "value": 1789000000000
+       },
+       "TimeZone": {
+        "type": "STRING",
+        "value": "Europe/Rome"
+       },
+       "AlarmIDs": {
+        "type": "STRING_LIST",
+        "value": [
+         "Alarm/X1"
+        ]
+       },
+       "HashtagIDs": {
+        "type": "STRING_LIST",
+        "value": [
+         "H1"
+        ]
+       },
+       "ParentReminder": {
+        "type": "REFERENCE",
+        "value": {
+         "recordName": "Reminder/P0"
+        }
+       }
+      },
+      "recordChangeTag": "tag-1"
+     }
+    ]
+   }
+  },
+  {
+   "path": "/database/1/com.apple.reminders/production/private/records/modify",
+   "query": {
+    "remapEnums": "true",
+    "getCurrentSyncToken": "true",
+    "clientBuildNumber": "B",
+    "clientMasteringNumber": "M",
+    "clientId": "CID",
+    "dsid": "42"
+   },
+   "body": {
+    "operations": [
+     {
+      "operationType": "update",
+      "record": {
+       "recordName": "Reminder/AAAA-1",
+       "recordType": "Reminder",
+       "fields": {
+        "TitleDocument": {
+         "type": "STRING",
+         "value": "eJzjYBCq52AQYJCqFJJ0zs8tKEosSlXIzFHISSwpSVVIyVQozs9MlBLgYgEpAioD0xqMYBFGoIikFJjWYJIS4+IAyv0HAn6gOjhbSYZLikvgSvapJ9LtaQd7S98/jpnoeliIiUMSiBm1gDQAVlcffw=="
+        },
+        "NotesDocument": {
+         "type": "STRING",
+         "value": "eJzjYBAq5WAQYJDKF+L3zCtJLcrXUTBSyMksKcqUEuBiAUkBJcG0BiNYhBEowi8FpjWYpMS4OIBy/4GAH6gOzlaS4ZLiEriSfeqJdHvawd7S949jJroeFmLi4AdiRi0gDQB3jhtV"
+        },
+        "Completed": {
+         "type": "INT64",
+         "value": 1
+        },
+        "CompletionDate": {
+         "type": "TIMESTAMP",
+         "value": 1790000000123
+        },
+        "Priority": {
+         "type": "INT64",
+         "value": 1
+        },
+        "Flagged": {
+         "type": "INT64",
+         "value": 1
+        },
+        "AllDay": {
+         "type": "INT64",
+         "value": 0
+        },
+        "LastModifiedDate": {
+         "type": "TIMESTAMP",
+         "value": 1790000000123
+        },
+        "DueDate": {
+         "type": "TIMESTAMP"
+        },
+        "TimeZone": {
+         "type": "STRING",
+         "value": "Europe/Rome"
+        },
+        "ParentReminder": {
+         "type": "REFERENCE"
+        },
+        "ResolutionTokenMap": {
+         "type": "STRING",
+         "value": "{\"map\":{\"titleDocument\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000011\"},\"notesDocument\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000012\"},\"completed\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000013\"},\"completionDate\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000014\"},\"priority\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000015\"},\"flagged\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000016\"},\"allDay\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000017\"},\"lastModifiedDate\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000018\"},\"dueDate\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-000000000019\"},\"timeZone\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000001A\"},\"parentReminder\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000001B\"}}}"
+        }
+       },
+       "pluginFields": {},
+       "recordChangeTag": "tag-1"
+      }
+     }
+    ],
+    "zoneID": {
+     "zoneName": "Reminders",
+     "zoneType": "REGULAR_CUSTOM_ZONE"
+    }
+   },
+   "reply": {
+    "records": [
+     {
+      "recordName": "Reminder/AAAA-1",
+      "recordType": "Reminder",
+      "fields": {},
+      "recordChangeTag": "tag-NEW"
+     }
+    ]
+   }
+  },
+  {
+   "path": "/database/1/com.apple.reminders/production/private/records/modify",
+   "query": {
+    "remapEnums": "true",
+    "getCurrentSyncToken": "true",
+    "clientBuildNumber": "B",
+    "clientMasteringNumber": "M",
+    "clientId": "CID",
+    "dsid": "42"
+   },
+   "body": {
+    "operations": [
+     {
+      "operationType": "update",
+      "record": {
+       "recordName": "Reminder/AAAA-1",
+       "recordType": "Reminder",
+       "fields": {
+        "Deleted": {
+         "type": "INT64",
+         "value": 1
+        },
+        "ResolutionTokenMap": {
+         "type": "STRING",
+         "value": "{\"map\":{\"deleted\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000001C\"},\"lastModifiedDate\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000001D\"}}}"
+        },
+        "LastModifiedDate": {
+         "type": "TIMESTAMP",
+         "value": 1790000000123
+        }
+       },
+       "pluginFields": {},
+       "recordChangeTag": "tag-NEW"
+      }
+     }
+    ],
+    "zoneID": {
+     "zoneName": "Reminders",
+     "zoneType": "REGULAR_CUSTOM_ZONE"
+    }
+   },
+   "reply": {
+    "records": [
+     {
+      "recordName": "Reminder/AAAA-1",
+      "recordType": "Reminder",
+      "fields": {},
+      "recordChangeTag": "tag-NEW"
+     }
+    ]
+   }
+  }
+ ],
+ "crdt_vectors": [
+  {
+   "text": "",
+   "document_hex": "08001250080010001a4a12001a100a040800100010001a040800100028011a160a08080010ffffffff0f10001a08080010ffffffff0f221c0a1a0a10d46bcae41b8766c18d75efe35c9145c31202080012020801",
+   "wire": "eJzjYBAK4GAQYJDyEmKQEuBiAbGBPDCtwSglxsUBZP0HAn6gKJytJMMlxSVwJfvUE+n2tIO9pe8fx0x0PSzExMEAxIwAhRkUpg=="
+  },
+  {
+   "text": "Comprare il latte",
+   "document_hex": "08001277080010001a711211436f6d707261726520696c206c617474651a100a040800100010001a040800100028011a100a040801100010111a040801100028021a160a08080010ffffffff0f10001a08080010ffffffff0f221c0a1a0a10d46bcae41b8766c18d75efe35c9145c312020811120208012a020811",
+   "wire": "eJzjYBAq52AQYJAqFBJ0zs8tKEosSlXIzFHISSwpSZUS4GIBSQKlwbQGI1iEESgiKAWmNZikxLg4gHL/gYAfqA7OVpLhkuISuJJ96ol0e9rB3tL3j2Mmuh4WYuIQBGJGLSANAP81HJY="
+  },
+  {
+   "text": "Café ☕ 🎉 ok",
+   "document_hex": "08001277080010001a711211436166c3a920e2989520f09f8e89206f6b1a100a040800100010001a040800100028011a100a0408011000100c1a040801100028021a160a08080010ffffffff0f10001a08080010ffffffff0f221c0a1a0a10d46bcae41b8766c18d75efe35c9145c31202080c120208012a02080c",
+   "wire": "eJzjYBAq52AQYJAqFBJ0Tkw7vFLh0YypCh/m93Uq5GdLCXCxgCSB0mBagxEswggU4ZEC0xpMUmJcHEC5/0DAD1QHZyvJcElxCVzJPvVEuj3tYG/p+8cxE10PCzFx8AAxoxaQBgDLLB6E"
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "document_hex": "0800129703080010001a900312ac026161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161611a100a040800100010001a040800100028011a110a040801100010ac021a040801100028021a160a08080010ffffffff0f10001a08080010ffffffff0f221d0a1b0a10d46bcae41b8766c18d75efe35c9145c3120308ac02120208012a0308ac02",
+   "wire": "eJzjYBCazszBIMAgNYFZaA1T4iggGkgJcLGAQg4YdmBag1FKECjCCBRZwyQFZmgwSYlxcQAl/wMBP1AhnK0kyyXNJXAl+9QT6fa0g72l7x/HTHQ9LMTMsYZJiImDUQvEAACbP4qY"
+  }
+ ],
+ "token_map": "{\"map\":{\"titleDocument\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000001E\"},\"lastModifiedDate\":{\"counter\":1,\"modificationTime\":811692800.1229999,\"replicaID\":\"00000000-0000-4000-8000-00000000001F\"}}}"
+}

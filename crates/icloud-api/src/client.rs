@@ -31,8 +31,10 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 
 use crate::{
+    cloudkit::{CloudKit, Database},
     drive::HttpDrive,
     error::{Error, Result},
+    reminders::{self, RemindersService},
     session::{CT_JSON, Session, USER_AGENT},
     srp::{Protocol, SrpClient, derive_password},
     twofactor::{TrustedPhone, TwoFactorOptions, parse_boot_args},
@@ -474,18 +476,42 @@ impl Client {
     /// Open the Drive service.
     pub fn drive(&self) -> Result<HttpDrive> {
         self.request_pcs("iclouddrive")?;
-        let url = |key: &str| {
-            self.state()
-                .data
-                .get("webservices")
-                .and_then(|w| w.get(key))
-                .and_then(|s| s.get("url"))
-                .and_then(Value::as_str)
-                .filter(|u| !u.trim().is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| Error::NotActivated(format!("webservice `{key}` is not available for this account")))
-        };
-        Ok(HttpDrive::new(Arc::clone(&self.session), url("drivews")?, url("docws")?, self.params()))
+        Ok(HttpDrive::new(
+            Arc::clone(&self.session),
+            self.webservice_url("drivews")?,
+            self.webservice_url("docws")?,
+            self.params(),
+        ))
+    }
+
+    /// Open the Reminders service. Shares this client's session, so one
+    /// sign-in serves Drive and Reminders alike.
+    ///
+    /// With Advanced Data Protection on, the first call asks Apple to send a
+    /// consent prompt to the user's devices and waits for it to be approved.
+    pub fn reminders(&self) -> Result<RemindersService> {
+        self.request_pcs(reminders::PCS_APP)?;
+        let ck = CloudKit::new(
+            Arc::clone(&self.session),
+            &self.webservice_url("ckdatabasews")?,
+            reminders::CONTAINER,
+            Database::Private,
+            self.params(),
+        );
+        Ok(RemindersService::new(ck))
+    }
+
+    /// URL of a web service, from the account record.
+    fn webservice_url(&self, key: &str) -> Result<String> {
+        self.state()
+            .data
+            .get("webservices")
+            .and_then(|w| w.get(key))
+            .and_then(|s| s.get("url"))
+            .and_then(Value::as_str)
+            .filter(|u| !u.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| Error::NotActivated(format!("webservice `{key}` is not available for this account")))
     }
 
     /// Ask Apple for permission to touch a service's data ("PCS"). On most

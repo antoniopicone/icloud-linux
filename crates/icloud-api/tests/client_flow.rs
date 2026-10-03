@@ -315,6 +315,49 @@ fn drive_needs_the_webservice_urls_from_the_account_record() {
     let client = client(&server, None);
     client.login(&password()).unwrap();
     assert!(matches!(client.drive(), Err(Error::NotActivated(_))));
+    assert!(matches!(client.reminders(), Err(Error::NotActivated(_))), "reminders need ckdatabasews");
+}
+
+#[test]
+fn reminders_ask_for_pcs_then_reach_the_reminders_container_with_the_same_session() {
+    let server = MockServer::start();
+    script_srp(&server, 200);
+    server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/accountLogin");
+        then.status(200).header("content-type", "application/json").json_body(json!({
+            "hsaTrustedBrowser": true, "dsInfo": {"dsid": "77"},
+            "webservices": {"ckdatabasews": {"url": server.url("/ck")}},
+        }));
+    });
+    // Advanced Data Protection on, consent already given.
+    server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/requestWebAccessState");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({"isICDRSDisabled": true, "isDeviceConsentedForPCS": true}));
+    });
+    let pcs = server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/requestPCS").json_body_includes(r#"{"appName": "reminders"}"#);
+        then.status(200).header("content-type", "application/json").json_body(json!({"status": "success"}));
+    });
+    let changes = server.mock(|when, then| {
+        when.method(POST)
+            .path("/ck/database/1/com.apple.reminders/production/private/changes/zone")
+            .query_param("dsid", "77")
+            .query_param("remapEnums", "true")
+            .query_param("getCurrentSyncToken", "true");
+        then.status(200).header("content-type", "application/json").json_body(json!({
+            "zones": [{"records": [{"recordName": "List/L1", "recordType": "List",
+                "fields": {"Name": {"type": "STRING", "value": "Spesa"}}}], "moreComing": false}]
+        }));
+    });
+
+    let client = client(&server, None);
+    client.login(&password()).unwrap();
+    let lists = client.reminders().unwrap().lists().unwrap();
+    assert_eq!(lists[0].title, "Spesa");
+    pcs.assert();
+    changes.assert();
 }
 
 #[test]
