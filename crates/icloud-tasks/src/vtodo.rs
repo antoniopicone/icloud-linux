@@ -441,6 +441,15 @@ pub enum RecurrenceChange {
     Delete(String),
 }
 
+/// iCalendar carries whole seconds, iCloud milliseconds: a value that lands
+/// in the same second as the current one is the current one, not an edit.
+fn keep_if_same_second(new: Option<OffsetDateTime>, current: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
+    match (new, current) {
+        (Some(n), Some(c)) if n.unix_timestamp() == c.unix_timestamp() => Some(c),
+        _ => new,
+    }
+}
+
 /// iCalendar priority to the three levels Reminders shows.
 fn reminders_priority(priority: u8) -> i64 {
     match priority {
@@ -461,8 +470,11 @@ impl Task {
         reminder.title.clone_from(&self.summary);
         reminder.notes.clone_from(&self.description);
         reminder.completed = self.completed;
-        reminder.completed_date =
-            if self.completed { self.completed_at.and_then(to_time).or(before.completed_date) } else { None };
+        reminder.completed_date = if self.completed {
+            keep_if_same_second(self.completed_at.and_then(to_time), before.completed_date).or(before.completed_date)
+        } else {
+            None
+        };
         reminder.priority = reminders_priority(self.priority);
         reminder.flagged = self.flagged;
         if self.time_zone.is_some() {
@@ -474,12 +486,19 @@ impl Task {
                 reminder.all_day = false;
             }
             Some(Due::At(at)) => {
-                reminder.due_date = to_time(at);
+                reminder.due_date = keep_if_same_second(to_time(at), before.due_date);
                 reminder.all_day = false;
             }
             Some(Due::Date(date)) => {
-                let midnight = date.to_zoned(zone(reminder.time_zone.as_deref())).ok().map(|z| z.timestamp());
-                reminder.due_date = midnight.and_then(to_time);
+                let tz = zone(reminder.time_zone.as_deref());
+                let same_day = before.all_day
+                    && before.due_date.and_then(to_jiff).map(|ts| ts.to_zoned(tz.clone()).date()) == Some(date);
+                reminder.due_date = if same_day {
+                    // Whatever time of day Apple stores for this day, keep it.
+                    before.due_date
+                } else {
+                    date.to_zoned(tz).ok().map(|z| z.timestamp()).and_then(to_time)
+                };
                 reminder.all_day = true;
             }
         }
@@ -650,17 +669,18 @@ mod tests {
     #[test]
     fn all_day_dates_are_days_in_the_reminder_time_zone() {
         let (mut reminder, contents) = sample();
-        // 23:30 UTC on the 22nd is already the 23rd in Rome.
+        // 22:30 UTC on the 22nd is already 00:30 on the 23rd in Rome.
         reminder.due_date = Some(datetime!(2026-09-22 22:30 UTC));
         reminder.all_day = true;
         let ics = Task::from_reminder(&reminder, &contents).to_ics();
         assert!(ics.contains("DUE;VALUE=DATE:20260923\r\n"), "{ics}");
         assert!(!ics.contains("BEGIN:VALARM"), "no alarm on all-day reminders");
 
-        let mut copy = reminder.clone();
-        Task::from_ics(&ics).unwrap().apply_to(&mut copy, &contents);
-        assert_eq!(copy.due_date, Some(datetime!(2026-09-22 22:00 UTC)), "midnight in Rome");
-        assert!(copy.all_day);
+        // A new all-day date lands on midnight in the reminder's zone.
+        let mut fresh = Reminder { time_zone: Some("Europe/Rome".into()), ..Reminder::default() };
+        Task::from_ics(&ics).unwrap().apply_to(&mut fresh, &contents);
+        assert_eq!(fresh.due_date, Some(datetime!(2026-09-22 22:00 UTC)), "midnight in Rome");
+        assert!(fresh.all_day);
     }
 
     /// The kind of VTODO a `CalDAV` client such as Planify writes.
@@ -698,6 +718,37 @@ mod tests {
 
         // Other clients' properties survive our rewrite.
         assert!(task.to_ics().contains("X-APPLE-SORT-ORDER:12\r\n"));
+    }
+
+    /// iCloud keeps milliseconds and may store an all-day date at any time
+    /// of that day; a VTODO carries neither. Reading a task back must not
+    /// look like an edit, or every sync would rewrite every reminder.
+    #[test]
+    fn precision_lost_in_icalendar_is_not_an_edit() {
+        let (mut reminder, contents) = sample();
+        reminder.completed = true;
+        reminder.completed_date = Some(datetime!(2026-09-24 09:00:00.734 UTC));
+        reminder.due_date = Some(datetime!(2026-09-23 08:00:00.250 UTC));
+        let back = Task::from_ics(&Task::from_reminder(&reminder, &contents).to_ics()).unwrap();
+        let mut copy = reminder.clone();
+        let (changed, _) = back.apply_to(&mut copy, &contents);
+        assert!(!changed, "{copy:#?}");
+        assert_eq!(copy.completed_date, reminder.completed_date, "milliseconds kept");
+
+        // All-day, stored at noon UTC rather than midnight in Rome.
+        reminder.all_day = true;
+        reminder.due_date = Some(datetime!(2026-09-23 12:00 UTC));
+        let back = Task::from_ics(&Task::from_reminder(&reminder, &contents).to_ics()).unwrap();
+        let mut copy = reminder.clone();
+        let (changed, _) = back.apply_to(&mut copy, &contents);
+        assert!(!changed, "same day, different storage time: {copy:#?}");
+        assert_eq!(copy.due_date, reminder.due_date);
+
+        // A real move to another day is still an edit.
+        let moved = Task { due: Some(Due::Date(civil::date(2026, 9, 24))), ..back };
+        let (changed, _) = moved.apply_to(&mut copy, &contents);
+        assert!(changed);
+        assert_eq!(copy.due_date, Some(datetime!(2026-09-23 22:00 UTC)), "midnight of the 24th in Rome");
     }
 
     #[test]

@@ -1318,6 +1318,8 @@ version = "0.2.0"
 dependencies = [
  "icloud-api",
  "jiff",
+ "rpassword",
+ "secrecy",
  "serde_json",
  "thiserror",
  "time",
