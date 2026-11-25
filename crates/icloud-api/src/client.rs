@@ -221,7 +221,7 @@ impl Client {
     /// Reuse the saved session. Needs no password.
     ///
     /// Returns [`Error::AuthRequired`] when there is nothing to reuse, Apple
-    /// no longer accepts it, or it belongs to an untrusted browser.
+    /// no longer accepts it, or it still needs a verification code.
     pub fn resume(&self) -> Result<()> {
         if !self.session.has_credentials() {
             return Err(Error::AuthRequired("no saved iCloud session".into()));
@@ -236,8 +236,8 @@ impl Client {
             })?
             .value()?;
         self.adopt_account_data(reply);
-        if !self.is_trusted() {
-            return Err(Error::AuthRequired("the saved session is not trusted".into()));
+        if !self.is_verified() {
+            return Err(Error::AuthRequired("the saved session still needs a verification code".into()));
         }
         Ok(())
     }
@@ -399,6 +399,14 @@ impl Client {
 
     fn is_trusted(&self) -> bool {
         self.state().data.get("hsaTrustedBrowser").and_then(Value::as_bool).unwrap_or(false)
+    }
+
+    /// The session needs no further code. A trusted session qualifies; so does
+    /// one Apple explicitly reports as past its challenge
+    /// (`hsaChallengeRequired: false`) without remembering the browser, which
+    /// is what a sign-in on icloud.com gives unless the person chose Trust.
+    fn is_verified(&self) -> bool {
+        self.is_trusted() || self.state().data.get("hsaChallengeRequired").and_then(Value::as_bool) == Some(false)
     }
 
     /// Record that a code is needed and learn how it can be delivered.

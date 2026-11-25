@@ -383,3 +383,37 @@ fn a_browser_session_apple_does_not_trust_is_refused() {
     let err = client(&server, None).adopt_browser_session(&[browser_cookie("X-APPLE-WEBAUTH-TOKEN", "t")]).unwrap_err();
     assert!(matches!(err, Error::LoginFailed(_)), "{err:?}");
 }
+
+fn verified_but_not_trusted() -> serde_json::Value {
+    let mut reply = account_reply(false);
+    reply["hsaChallengeRequired"] = json!(false);
+    reply
+}
+
+#[test]
+fn a_browser_session_past_its_challenge_is_adopted_even_if_the_browser_is_not_remembered() {
+    // What icloud.com gives today when the person signs in without choosing Trust.
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/validate");
+        then.status(200).header("content-type", "application/json").json_body(verified_but_not_trusted());
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let client = client(&server, Some(dir.path()));
+    client.adopt_browser_session(&[browser_cookie("X-APPLE-WEBAUTH-TOKEN", "t")]).unwrap();
+    // And the daemon can resume it later.
+    self::client(&server, Some(dir.path())).resume().unwrap();
+}
+
+#[test]
+fn a_session_that_still_needs_a_code_is_never_resumed() {
+    let server = MockServer::start();
+    let mut reply = account_reply(false);
+    reply["hsaChallengeRequired"] = json!(true);
+    server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/validate");
+        then.status(200).header("content-type", "application/json").json_body(reply.clone());
+    });
+    let err = client(&server, None).adopt_browser_session(&[browser_cookie("X-APPLE-WEBAUTH-TOKEN", "t")]).unwrap_err();
+    assert!(matches!(err, Error::LoginFailed(_)), "{err:?}");
+}

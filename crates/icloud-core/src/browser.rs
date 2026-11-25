@@ -14,6 +14,7 @@
 
 use std::{
     fs,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -29,8 +30,13 @@ use crate::{
     setup,
 };
 
+/// Set by older icloud.com sign-ins when the browser is trusted; imported when
+/// present, never waited for.
+#[cfg(test)]
 const TRUST_COOKIE: &str = "X-APPLE-WEBAUTH-HSA-TRUST";
+/// Set together when the sign-in is complete (`accountLogin`).
 const SESSION_COOKIE: &str = "X-APPLE-WEBAUTH-TOKEN";
+const USER_COOKIE: &str = "X-APPLE-WEBAUTH-USER";
 const START_URL: &str = "https://www.icloud.com/";
 /// Chromium-based browsers, by the names their packages put on `PATH`.
 const BROWSERS: &[&str] = &[
@@ -154,19 +160,37 @@ pub fn require_browser() -> Result<PathBuf> {
 /// How long to wait for the person to finish signing in on icloud.com.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// Kills the browser when dropped, so no path leaves it running.
+/// Stops the browser when dropped, so no path leaves it running.
+///
+/// The browser command is often a wrapper script (`/usr/bin/brave-origin`,
+/// `google-chrome`) that starts the real browser as its child, so killing the
+/// child alone would leave the window open. The browser is started in a
+/// process group of its own, and the whole group is stopped.
 #[derive(Debug)]
 struct BrowserProcess(Child);
 
 impl Drop for BrowserProcess {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+
+        let group = Pid::from_child(&self.0);
+        let _ = kill_process_group(group, Signal::TERM);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let _ = self.0.try_wait(); // reap the wrapper, or the group never looks empty
+            if test_kill_process_group(group).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let _ = kill_process_group(group, Signal::KILL);
         let _ = self.0.wait();
     }
 }
 
 fn spawn(browser: &Path, profile: &Path) -> Result<Child> {
     Command::new(browser)
+        .process_group(0)
         .arg(format!("--user-data-dir={}", profile.display()))
         .arg("--remote-debugging-port=0")
         .args(["--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check"])
@@ -249,7 +273,8 @@ fn is_apple_domain(domain: &str) -> bool {
 }
 
 /// The Apple cookies in a `Storage.getCookies` reply, once the sign-in is
-/// complete: the session cookie and the trust cookie are both there.
+/// complete: icloud.com sets the session and user cookies together, after
+/// the code and the "trust this browser" question.
 fn signed_in_cookies(reply: &Value) -> Option<Vec<BrowserCookie>> {
     let cookies: Vec<BrowserCookie> = reply
         .get("result")?
@@ -271,7 +296,7 @@ fn signed_in_cookies(reply: &Value) -> Option<Vec<BrowserCookie>> {
         })
         .collect();
     let has = |name: &str| cookies.iter().any(|c| c.name == name && !c.value.is_empty());
-    (has(TRUST_COOKIE) && has(SESSION_COOKIE)).then_some(cookies)
+    (has(SESSION_COOKIE) && has(USER_COOKIE)).then_some(cookies)
 }
 
 #[cfg(test)]
@@ -310,22 +335,31 @@ mod tests {
     }
 
     #[test]
-    fn the_sign_in_is_complete_only_with_both_the_session_and_the_trust_cookie() {
-        let trust = cookie(TRUST_COOKIE, ".icloud.com", "t");
+    fn the_sign_in_is_complete_once_the_session_and_user_cookies_are_both_set() {
         let session = cookie(SESSION_COOKIE, ".icloud.com", "s");
+        let user = cookie(USER_COOKIE, ".icloud.com", "u");
         assert!(signed_in_cookies(&reply(vec![])).is_none());
-        assert!(signed_in_cookies(&reply(vec![trust.clone()])).is_none());
         assert!(signed_in_cookies(&reply(vec![session.clone()])).is_none());
-        assert!(signed_in_cookies(&reply(vec![cookie(TRUST_COOKIE, ".icloud.com", ""), session.clone()])).is_none());
-        let done = signed_in_cookies(&reply(vec![trust, session, cookie("other", ".apple.com", "o")])).unwrap();
-        assert_eq!(done.len(), 3);
-        assert!(done.iter().all(|c| c.secure && c.http_only && c.expires.is_some()));
+        assert!(signed_in_cookies(&reply(vec![user.clone()])).is_none());
+        assert!(signed_in_cookies(&reply(vec![cookie(SESSION_COOKIE, ".icloud.com", ""), user.clone()])).is_none());
+        // Today's icloud.com sets no trust cookie; it is imported when an older flow sets one.
+        let done = signed_in_cookies(&reply(vec![session.clone(), user.clone()])).unwrap();
+        assert_eq!(done.len(), 2);
+        let with_trust = signed_in_cookies(&reply(vec![
+            session,
+            user,
+            cookie(TRUST_COOKIE, ".icloud.com", "t"),
+            cookie("other", ".apple.com", "o"),
+        ]))
+        .unwrap();
+        assert_eq!(with_trust.len(), 4);
+        assert!(with_trust.iter().all(|c| c.secure && c.http_only && c.expires.is_some()));
     }
 
     #[test]
     fn cookies_of_other_sites_are_never_taken() {
         let list = vec![
-            cookie(TRUST_COOKIE, ".icloud.com", "t"),
+            cookie(USER_COOKIE, ".icloud.com", "u"),
             cookie(SESSION_COOKIE, ".icloud.com", "s"),
             cookie("tracker", ".example.com", "x"),
             cookie("sneaky", "evilicloud.com", "x"),
@@ -349,7 +383,7 @@ mod tests {
                     json!([])
                 } else {
                     json!([
-                        cookie(TRUST_COOKIE, ".icloud.com", "trusted"),
+                        cookie(USER_COOKIE, ".icloud.com", "user"),
                         cookie(SESSION_COOKIE, ".icloud.com", "session"),
                     ])
                 };
@@ -359,7 +393,34 @@ mod tests {
         });
         let cookies = wait_for_cookie(&format!("ws://127.0.0.1:{port}/devtools/browser/x"), Duration::from_secs(30));
         server.join().unwrap();
-        assert!(cookies.unwrap().iter().any(|c| c.value == "trusted"));
+        assert!(cookies.unwrap().iter().any(|c| c.value == "session"));
+    }
+
+    #[test]
+    fn stopping_the_browser_also_stops_what_its_wrapper_script_started() {
+        // Like /usr/bin/brave-origin: a shell script whose child is the real browser.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let wrapper = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 60 & echo $! > {}; wait", pid_file.display()))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let child_pid = loop {
+            if let Ok(text) = fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the wrapper never started its child");
+            thread::sleep(Duration::from_millis(20));
+        };
+        drop(BrowserProcess(wrapper));
+        let alive = Path::new(&format!("/proc/{child_pid}")).exists()
+            && !fs::read_to_string(format!("/proc/{child_pid}/stat")).unwrap_or_default().contains(") Z ");
+        assert!(!alive, "the browser started by the wrapper is still running");
     }
 
     #[test]
