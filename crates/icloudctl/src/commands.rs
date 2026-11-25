@@ -12,9 +12,13 @@ use secrecy::SecretString;
 
 use crate::{
     auth::{self, AuthOptions},
+    browser,
     cli::Command,
     prompt::{Prompter, confirm},
 };
+
+/// How long to wait for the person to finish signing in on icloud.com.
+const BROWSER_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[allow(missing_debug_implementations)]
 pub struct Context<'a> {
@@ -39,7 +43,12 @@ pub fn run(command: Command, ctx: &mut Context<'_>) -> Result<()> {
         Command::Quickstart { mount_dir } => quickstart(ctx, mount_dir),
         Command::Init { mount_dir } => init(ctx, mount_dir),
         Command::Configure { email, store_password } => configure(ctx, email, store_password),
-        Command::Auth { force_sms, trust_token, debug } => {
+        Command::Auth { force_sms, trust_token, from_browser, debug } => {
+            let trust_token = if from_browser {
+                Some(browser::trust_token_from_browser(ctx.ui, BROWSER_SIGN_IN_TIMEOUT)?)
+            } else {
+                trust_token
+            };
             authenticate(ctx, &AuthOptions { force_sms, trust_token, debug })
         }
         Command::Start => {

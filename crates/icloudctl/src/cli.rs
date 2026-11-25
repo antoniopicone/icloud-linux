@@ -45,6 +45,10 @@ pub enum Command {
         /// Import a `X-APPLE-WEBAUTH-HSA-TRUST` value from a signed-in browser.
         #[arg(long, value_name = "TOKEN")]
         trust_token: Option<String>,
+        /// Sign in on icloud.com in a browser window instead of typing a code.
+        /// The password is still asked for. Needs a Chromium-based browser.
+        #[arg(long, conflicts_with = "trust_token")]
+        from_browser: bool,
         /// Show what Apple reported about the challenge, and enable `--verbose`.
         #[arg(long)]
         debug: bool,
@@ -159,6 +163,7 @@ mod tests {
         assert!(
             matches!(parse(&["auth", "--trust-token", "abc"]), Command::Auth { trust_token: Some(t), .. } if t == "abc")
         );
+        assert!(matches!(parse(&["auth", "--from-browser"]), Command::Auth { from_browser: true, .. }));
         assert!(matches!(
             parse(&["hydrate", "--dry-run", "--verbose"]),
             Command::Hydrate { dry_run: true, verbose: true }

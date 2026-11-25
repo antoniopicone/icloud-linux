@@ -92,6 +92,7 @@ Two-factor works three ways:
 |---|---|
 | Text message | `icloudctl auth --force-sms`, or type `sms` at the prompt. Works for every account with a trusted phone number, and is what the installer offers. |
 | Code from a trusted device | Type the six digits your iPhone/iPad/Mac shows. Only for accounts where Apple sends it by itself; see below. |
+| Sign in on icloud.com | `icloudctl auth --from-browser` opens a Chromium-based browser (Chromium, Chrome, Brave, Edge; or set `ICLOUD_BROWSER`) with a temporary profile. Sign in on icloud.com and answer "Trust this browser"; the trust cookie is read from that profile, which is then deleted. Replaces the code only: the password is still asked for. |
 | Browser trust token | `icloudctl auth --trust-token <X-APPLE-WEBAUTH-HSA-TRUST from icloud.com cookies>` skips the code. |
 
 Not supported: Apple's newer push-to-device bridge and hardware security keys. On most accounts Apple no longer shows a code on your devices unless the app performs that push handshake (the sign-in page announces it as `auth/bridge/step`); nothing would ever arrive, so those accounts are steered to the text message instead of being left waiting. If your account can only use those, sign in at icloud.com once and import the trust token above. If a push popup appears instead of a code, use the text message.
