@@ -14,17 +14,13 @@ use std::{
 
 use gtk::{gio, glib, prelude::*};
 use gtk4 as gtk;
-use icloud_api::{AccountInfo, TwoFactorOptions};
+use icloud_api::AccountInfo;
 use icloud_core::{
     Layout,
     config::CrawlMode,
-    installer::{
-        AuthEvent, AuthRequest, AuthWorker, Backend, Channel, InstallPlan, MAX_CODE_ATTEMPTS, Prepared, StepOutcome,
-        code_is_complete, validate_account, validate_apple_id, validate_mount_dir,
-    },
+    installer::{Backend, InstallPlan, Prepared, StepOutcome, validate_mount_dir},
     setup::Severity,
 };
-use secrecy::SecretString;
 
 thread_local! {
     /// The callbacks hold only weak references (so nothing leaks through a
@@ -33,11 +29,10 @@ thread_local! {
     static ALIVE: RefCell<Option<Rc<Wizard>>> = const { RefCell::new(None) };
 }
 
-const STEPS: [(&str, &str); 6] = [
+const STEPS: [(&str, &str); 5] = [
     ("welcome", "Requirements"),
     ("folder", "Folder"),
     ("account", "Apple ID"),
-    ("verify", "Verification"),
     ("install", "Setting up"),
     ("done", "Done"),
 ];
@@ -50,7 +45,6 @@ const CSS: &str = "
 .check-bad { color: #c0392b; font-weight: 700; }
 .error-text { color: #c0392b; }
 .note-text { opacity: 0.7; font-size: 9pt; }
-.big-code { font-size: 20pt; letter-spacing: 6px; }
 .step-row { padding: 6px 0; }
 ";
 
@@ -163,22 +157,9 @@ struct Widgets {
     folder_busy: Busy,
     folder_next: gtk::Button,
     // account
-    username: gtk::Entry,
-    password: gtk::PasswordEntry,
-    remember: gtk::CheckButton,
     account_message: gtk::Label,
     account_busy: Busy,
     sign_in: gtk::Button,
-    sign_in_browser: gtk::Button,
-    // verify
-    device: gtk::CheckButton,
-    sms: gtk::CheckButton,
-    phones: gtk::DropDown,
-    send_code: gtk::Button,
-    code_entry: gtk::Entry,
-    verify_message: gtk::Label,
-    verify_busy: Busy,
-    verify_button: gtk::Button,
     // install / done
     steps: gtk::Box,
     install_busy: Busy,
@@ -196,8 +177,6 @@ struct Wizard {
     layout: Layout,
     plan: RefCell<InstallPlan>,
     prepared: RefCell<Option<Prepared>>,
-    worker: RefCell<Option<AuthWorker>>,
-    options: RefCell<TwoFactorOptions>,
     account: RefCell<Option<AccountInfo>>,
     /// The open folder chooser, kept alive until it responds.
     chooser: RefCell<Option<gtk::FileChooserNative>>,
@@ -245,8 +224,6 @@ pub(crate) fn present(
         layout,
         plan: RefCell::new(plan),
         prepared: RefCell::new(None),
-        worker: RefCell::new(None),
-        options: RefCell::new(TwoFactorOptions::default()),
         account: RefCell::new(None),
         chooser: RefCell::new(None),
         widgets,
@@ -255,7 +232,6 @@ pub(crate) fn present(
     window.connect_destroy(|_| ALIVE.with(|alive| drop(alive.borrow_mut().take())));
 
     wire(&wizard);
-    start_event_pump(&wizard);
     wizard.refresh_requirements();
     if demo {
         wizard.prime_demo_page(start_page.as_deref());
@@ -276,7 +252,10 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
         "This sets up iCloud Drive as a normal folder on this computer. Files download when you open them, and changes you make are uploaded for you.",
     );
     if demo {
-        welcome.append(&label("Demo mode: nothing on this computer is changed. Use the code 123456; the password “wrong” fails and “trusted” skips verification.", &["note-text"]));
+        welcome.append(&label(
+            "Demo mode: nothing on this computer is changed, and no browser opens: the sign-in is pretended.",
+            &["note-text"],
+        ));
     }
     let checks = gtk::Box::new(gtk::Orientation::Vertical, 4);
     welcome.append(&checks);
@@ -323,21 +302,12 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     stack.add_named(&folder, Some("folder"));
 
     // account
-    let account =
-        page("Sign in with your Apple ID", "Your password goes straight to Apple. It is not stored unless you ask.");
-    let username = gtk::Entry::builder()
-        .placeholder_text("Apple ID (email or phone number)")
-        .hexpand(true)
-        .activates_default(false)
-        .build();
-    let password =
-        gtk::PasswordEntry::builder().placeholder_text("Password").show_peek_icon(true).hexpand(true).build();
-    account.append(&username);
-    account.append(&password);
-    let remember = gtk::CheckButton::with_label("Remember my password on this computer");
-    account.append(&remember);
+    let account = page(
+        "Sign in to iCloud",
+        "You sign in on Apple's own page, in a browser window that opens for this. Your Apple ID, password and verification code are typed there and never reach this app.",
+    );
     account.append(&label(
-        "Off is safer. If you turn it on, the password is saved in a file only you can read, and the service can renew an expired session by itself. Otherwise you sign in again when it expires (every few weeks).",
+        "When Apple asks whether to trust the browser, choose Trust: that is what keeps you signed in here. The window closes by itself when you are done. No password is stored; when the session expires, you sign in the same way again.",
         &["note-text"],
     ));
     let account_message = label("", &["error-text"]);
@@ -345,51 +315,9 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     let account_busy = Busy::new();
     account.append(&account_busy.row);
     let account_back = gtk::Button::with_label("Back");
-    let sign_in = gtk::Button::with_label("Use my password here instead");
-    sign_in.set_tooltip_text(Some(
-        "Type the password in this window. It goes straight to Apple, and you can choose to remember it.",
-    ));
-    let sign_in_browser = primary("Sign in on icloud.com");
-    account.append(&label(
-        "Recommended: sign in on Apple's own page in a browser window. Your password and code are typed there and never reach this app. Only your Apple ID is needed here.",
-        &["note-text"],
-    ));
-    account.append(&button_row(&[&account_back, &sign_in, &sign_in_browser]));
+    let sign_in = primary("Sign in on icloud.com");
+    account.append(&button_row(&[&account_back, &sign_in]));
     stack.add_named(&account, Some("account"));
-
-    // verify
-    let verify = page("Verify it is you", "Apple sent you a six-digit code. Choose how you want to receive it.");
-    let device = gtk::CheckButton::with_label("Show the code on one of my Apple devices");
-    let sms = gtk::CheckButton::with_label("Send the code by text message");
-    sms.set_group(Some(&device));
-    device.set_active(true);
-    verify.append(&device);
-    verify.append(&label("Approve the sign-in on your iPhone, iPad or Mac, then type the code it shows. Nothing appeared? Choose the text message.", &["note-text"]));
-    verify.append(&sms);
-    let phones = gtk::DropDown::from_strings(&[]);
-    phones.set_visible(false);
-    verify.append(&phones);
-    let send_code = gtk::Button::with_label("Send code");
-    send_code.set_halign(gtk::Align::Start);
-    send_code.set_visible(false);
-    verify.append(&send_code);
-    let code_entry = gtk::Entry::builder()
-        .placeholder_text("000000")
-        .max_length(10)
-        .input_purpose(gtk::InputPurpose::Digits)
-        .hexpand(true)
-        .build();
-    code_entry.add_css_class("big-code");
-    verify.append(&code_entry);
-    let verify_message = label("", &["error-text"]);
-    verify.append(&verify_message);
-    let verify_busy = Busy::new();
-    verify.append(&verify_busy.row);
-    let verify_back = gtk::Button::with_label("Start over");
-    let verify_button = primary("Verify");
-    verify_button.set_sensitive(false);
-    verify.append(&button_row(&[&verify_back, &verify_button]));
-    stack.add_named(&verify, Some("verify"));
 
     // install
     let install = page("Setting things up", "");
@@ -425,7 +353,6 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
         (&browse, "browse"),
         (&folder_back, "folder-back"),
         (&account_back, "account-back"),
-        (&verify_back, "verify-back"),
         (&close, "close"),
     ] {
         button.set_widget_name(name);
@@ -433,9 +360,6 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     welcome_next.set_widget_name("welcome-next");
     folder_next.set_widget_name("folder-next");
     sign_in.set_widget_name("sign-in");
-    sign_in_browser.set_widget_name("sign-in-browser");
-    send_code.set_widget_name("send-code");
-    verify_button.set_widget_name("verify");
     install_next.set_widget_name("install-next");
     open_folder.set_widget_name("open-folder");
 
@@ -450,21 +374,9 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
         folder_message,
         folder_busy,
         folder_next,
-        username,
-        password,
-        remember,
         account_message,
         account_busy,
         sign_in,
-        sign_in_browser,
-        device,
-        sms,
-        phones,
-        send_code,
-        code_entry,
-        verify_message,
-        verify_busy,
-        verify_button,
         steps,
         install_busy,
         install_next,
@@ -501,31 +413,21 @@ impl Wizard {
         let index = STEPS.iter().position(|(name, _)| *name == page).unwrap_or(0);
         self.step.set_label(&format!("STEP {} OF {}  ·  {}", index + 1, STEPS.len(), STEPS[index].1.to_uppercase()));
         self.stack.set_visible_child_name(page);
-        match page {
-            "verify" => self.prepare_verify_page(),
-            "install" => self.begin_install(),
-            _ => {}
+        if page == "install" {
+            self.begin_install();
         }
     }
 
     /// In the demo, jumping straight to a page needs the state the earlier
     /// pages would have produced.
     fn prime_demo_page(self: &Rc<Self>, page: Option<&str>) {
-        match page {
-            Some("verify") => {
-                if let Ok(auth) = self.backend.authenticator() {
-                    *self.options.borrow_mut() = auth.options();
-                }
-            }
-            Some("done") => {
-                let outcomes: Vec<StepOutcome> =
-                    ["Start the iCloud service", "Mount iCloud Drive", "Keep the search indexer out"]
-                        .iter()
-                        .map(|title| StepOutcome { title: (*title).to_owned(), result: Ok("done".into()) })
-                        .collect();
-                self.finish_page(&outcomes);
-            }
-            _ => {}
+        if page == Some("done") {
+            let outcomes: Vec<StepOutcome> =
+                ["Start the iCloud service", "Mount iCloud Drive", "Keep the search indexer out"]
+                    .iter()
+                    .map(|title| StepOutcome { title: (*title).to_owned(), result: Ok("done".into()) })
+                    .collect();
+            self.finish_page(&outcomes);
         }
     }
 
@@ -623,48 +525,22 @@ impl Wizard {
 
     // account
     fn sign_in(self: &Rc<Self>) {
-        self.start_sign_in(false);
-    }
-
-    fn sign_in_with_browser(self: &Rc<Self>) {
-        self.start_sign_in(true);
-    }
-
-    fn start_sign_in(self: &Rc<Self>, via_browser: bool) {
         let w = &self.widgets;
-        let (username, password) = (w.username.text().to_string(), w.password.text().to_string());
-        let valid = if via_browser { validate_apple_id(&username) } else { validate_account(&username, &password) };
-        if let Err(problem) = valid {
-            Self::show_error(&w.account_message, problem);
-            return;
-        }
         Self::show_note(&w.account_message, "");
         w.sign_in.set_sensitive(false);
-        w.sign_in_browser.set_sensitive(false);
-        w.account_busy.show(if via_browser { "Opening the browser…" } else { "Signing in…" });
-        // Nothing typed here is kept when the password is typed in the browser.
-        let remember = w.remember.is_active() && !via_browser;
-        self.plan.borrow_mut().remember_password = remember;
+        w.account_busy.show("Sign in on icloud.com in the browser window, and choose “Trust” when Apple asks…");
 
         let backend = Arc::clone(&self.backend);
-        let (user, pass) = (username.trim().to_owned(), password.clone());
         let weak = Rc::downgrade(self);
         background(
-            move || {
-                backend.save_account(&user, remember.then(|| SecretString::from(pass.clone())))?;
-                backend.authenticator()
-            },
+            move || backend.sign_in_with_browser(),
             move |result| {
                 let Some(wizard) = weak.upgrade() else { return };
                 match result {
-                    Ok(auth) => {
-                        let worker = AuthWorker::spawn(auth);
-                        worker.request(if via_browser {
-                            AuthRequest::LoginViaBrowser
-                        } else {
-                            AuthRequest::Login(SecretString::from(wizard.widgets.password.text().to_string()))
-                        });
-                        *wizard.worker.borrow_mut() = Some(worker);
+                    Ok(info) => {
+                        *wizard.account.borrow_mut() = Some(info);
+                        wizard.widgets.account_busy.hide();
+                        wizard.go("install");
                     }
                     Err(err) => wizard.account_failed(&err.to_string()),
                 }
@@ -676,148 +552,7 @@ impl Wizard {
         let w = &self.widgets;
         w.account_busy.hide();
         w.sign_in.set_sensitive(true);
-        w.sign_in_browser.set_sensitive(true);
         Self::show_error(&w.account_message, message);
-    }
-
-    // verify
-    fn prepare_verify_page(&self) {
-        let w = &self.widgets;
-        let options = self.options.borrow();
-        let names: Vec<String> = options
-            .phones
-            .iter()
-            .enumerate()
-            .map(|(i, p)| p.display.clone().unwrap_or_else(|| format!("Phone number {}", i + 1)))
-            .collect();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        w.phones.set_model(Some(&gtk::StringList::new(&refs)));
-        w.sms.set_sensitive(options.can_use_sms());
-        w.device.set_sensitive(options.device_code_available() || !options.can_use_sms());
-        let prefer_sms = !options.device_code_available() && options.can_use_sms();
-        w.sms.set_active(prefer_sms);
-        w.device.set_active(!prefer_sms);
-        w.code_entry.set_text("");
-        w.verify_button.set_sensitive(false);
-        w.verify_busy.hide();
-        Self::show_note(
-            &w.verify_message,
-            if options.push_bridge && options.can_use_sms() {
-                "For this account Apple does not show a code on your devices unless the app performs a push \
-                 handshake, which is not supported yet. Have the code sent by text message instead."
-            } else {
-                ""
-            },
-        );
-        drop(options);
-        self.update_delivery_widgets();
-    }
-
-    fn update_delivery_widgets(&self) {
-        let w = &self.widgets;
-        let sms = w.sms.is_active();
-        let many = self.options.borrow().phones.len() > 1;
-        w.phones.set_visible(sms && many);
-        w.send_code.set_visible(sms);
-    }
-
-    fn channel(&self) -> Channel {
-        if self.widgets.sms.is_active() {
-            Channel::Sms(self.widgets.phones.selected() as usize)
-        } else {
-            Channel::TrustedDevice
-        }
-    }
-
-    fn send_sms(&self) {
-        let w = &self.widgets;
-        if let Some(worker) = self.worker.borrow().as_ref() {
-            w.send_code.set_sensitive(false);
-            w.verify_busy.show("Sending the text message…");
-            worker.request(AuthRequest::SendSms { phone: w.phones.selected() as usize });
-        }
-    }
-
-    fn verify(&self) {
-        let w = &self.widgets;
-        let code = w.code_entry.text().to_string();
-        if !code_is_complete(&code) {
-            return;
-        }
-        if let Some(worker) = self.worker.borrow().as_ref() {
-            w.verify_button.set_sensitive(false);
-            w.verify_busy.show("Checking the code…");
-            worker.request(AuthRequest::Verify { channel: self.channel(), code });
-        }
-    }
-
-    fn handle(self: &Rc<Self>, event: AuthEvent) {
-        let w = &self.widgets;
-        match event {
-            AuthEvent::Authenticated(info) => {
-                *self.account.borrow_mut() = Some(info);
-                w.account_busy.hide();
-                w.verify_busy.hide();
-                self.go("install");
-            }
-            AuthEvent::BrowserOpened => {
-                w.account_busy.show("Sign in on icloud.com in the browser window, and choose “Trust this browser”…");
-            }
-            AuthEvent::CodeNeeded(options) => {
-                *self.options.borrow_mut() = options;
-                w.account_busy.hide();
-                w.sign_in.set_sensitive(true);
-                w.sign_in_browser.set_sensitive(true);
-                self.go("verify");
-            }
-            AuthEvent::SmsSent { to } => {
-                w.verify_busy.hide();
-                w.send_code.set_sensitive(true);
-                Self::show_note(&w.verify_message, &format!("A code was sent to {to}. Type it below."));
-            }
-            AuthEvent::CodeRejected { attempts_left } => {
-                w.verify_busy.hide();
-                w.code_entry.set_text("");
-                Self::show_error(
-                    &w.verify_message,
-                    &format!(
-                        "That code was not accepted. {attempts_left} attempt{} left.",
-                        if attempts_left == 1 { "" } else { "s" }
-                    ),
-                );
-            }
-            AuthEvent::OutOfAttempts => {
-                w.verify_busy.hide();
-                w.verify_button.set_sensitive(false);
-                w.code_entry.set_sensitive(false);
-                Self::show_error(
-                    &w.verify_message,
-                    &format!(
-                        "{MAX_CODE_ATTEMPTS} codes were not accepted. To protect your account, wait a few minutes and start over."
-                    ),
-                );
-            }
-            AuthEvent::Failed(message) => {
-                w.verify_busy.hide();
-                w.send_code.set_sensitive(true);
-                if self.stack.visible_child_name().as_deref() == Some("verify") {
-                    Self::show_error(&w.verify_message, &message);
-                } else {
-                    self.account_failed(&message);
-                }
-            }
-        }
-    }
-
-    fn start_over(self: &Rc<Self>) {
-        *self.worker.borrow_mut() = None;
-        let w = &self.widgets;
-        w.code_entry.set_sensitive(true);
-        w.sign_in.set_sensitive(true);
-        w.sign_in_browser.set_sensitive(true);
-        w.account_busy.hide();
-        Self::show_note(&w.account_message, "");
-        self.go("account");
     }
 
     // install
@@ -844,22 +579,11 @@ impl Wizard {
         }
         let mount = self.plan.borrow().mount_dir.display().to_string();
         self.add_step("Prepare the folder and the service", &Ok(mount.clone()));
-        self.add_step(
-            "Save your Apple ID",
-            &Ok(if self.plan.borrow().remember_password {
-                "password remembered".into()
-            } else {
-                "password not stored".into()
-            }),
-        );
         let who =
             self.account.borrow().as_ref().and_then(|a| a.apple_id.clone()).unwrap_or_else(|| "your account".into());
-        self.add_step("Sign in to iCloud", &Ok(who));
+        self.add_step("Sign in to iCloud", &Ok(format!("{who}, no password stored")));
         w.install_busy.show("Starting iCloud Drive…");
         w.install_next.set_sensitive(false);
-
-        // Sign-in is finished; free the worker (and Apple's session) now.
-        *self.worker.borrow_mut() = None;
 
         let (backend, plan) = (Arc::clone(&self.backend), self.plan.borrow().clone());
         let mount_dir = plan.mount_dir.clone();
@@ -964,10 +688,6 @@ fn wire(wizard: &Rc<Wizard>) {
     on("folder-next", Box::new(Wizard::continue_from_folder), weak(wizard));
     on("account-back", Box::new(|w| w.go("folder")), weak(wizard));
     on("sign-in", Box::new(Wizard::sign_in), weak(wizard));
-    on("sign-in-browser", Box::new(Wizard::sign_in_with_browser), weak(wizard));
-    on("verify-back", Box::new(Wizard::start_over), weak(wizard));
-    on("send-code", Box::new(|w| w.send_sms()), weak(wizard));
-    on("verify", Box::new(|w| w.verify()), weak(wizard));
     on("install-next", Box::new(|w| w.go("done")), weak(wizard));
     on("open-folder", Box::new(|w| w.open_folder()), weak(wizard));
     on("close", Box::new(|w| w.window.close()), weak(wizard));
@@ -981,59 +701,9 @@ fn wire(wizard: &Rc<Wizard>) {
         }
     };
     wizard.widgets.folder_entry.connect_activate(submit(weak(wizard), Wizard::continue_from_folder));
-    wizard.widgets.username.connect_activate({
-        let w = weak(wizard);
-        move |_| {
-            if let Some(w) = w.upgrade() {
-                w.widgets.password.grab_focus();
-            }
-        }
-    });
-    wizard.widgets.password.connect_activate({
-        let w = weak(wizard);
-        move |_| {
-            if let Some(w) = w.upgrade() {
-                w.sign_in();
-            }
-        }
-    });
-    wizard.widgets.code_entry.connect_activate(submit(weak(wizard), |w| w.verify()));
-    wizard.widgets.code_entry.connect_changed({
-        let w = weak(wizard);
-        move |entry| {
-            if let Some(w) = w.upgrade() {
-                let busy = w.widgets.verify_busy.row.is_visible();
-                w.widgets.verify_button.set_sensitive(code_is_complete(&entry.text()) && !busy && entry.is_sensitive());
-            }
-        }
-    });
-    for radio in [&wizard.widgets.device, &wizard.widgets.sms] {
-        let w = weak(wizard);
-        radio.connect_toggled(move |_| {
-            if let Some(w) = w.upgrade() {
-                w.update_delivery_widgets();
-            }
-        });
-    }
 }
 
-/// Poll the sign-in worker from the main loop.
-fn start_event_pump(wizard: &Rc<Wizard>) {
-    let weak = Rc::downgrade(wizard);
-    glib::timeout_add_local(Duration::from_millis(80), move || {
-        let Some(wizard) = weak.upgrade() else { return glib::ControlFlow::Break };
-        loop {
-            let event = wizard.worker.borrow().as_ref().and_then(AuthWorker::poll);
-            match event {
-                Some(event) => wizard.handle(event),
-                None => break,
-            }
-        }
-        glib::ControlFlow::Continue
-    });
-}
-
-/// Demo only: click through the whole wizard, wrong code included, so the
+/// Demo only: click through the whole wizard, so the
 /// flow can be watched (or screenshotted) without a person.
 fn autoplay(wizard: &Rc<Wizard>) {
     type Step = Box<dyn Fn(&Rc<Wizard>)>;
@@ -1048,21 +718,8 @@ fn autoplay(wizard: &Rc<Wizard>) {
         (1500, click("welcome-next")),
         (2500, Box::new(|w| w.widgets.folder_entry.set_text("/tmp/icloud-demo-mount"))),
         (2600, click("folder-next")),
-        (
-            4000,
-            Box::new(|w| {
-                w.widgets.username.set_text("demo@icloud.com");
-                w.widgets.password.set_text("secret");
-            }),
-        ),
-        (4100, click("sign-in")),
-        (6500, Box::new(|w| w.widgets.sms.set_active(true))),
-        (6700, click("send-code")),
-        (8000, Box::new(|w| w.widgets.code_entry.set_text("000000"))),
-        (8100, click("verify")),
-        (9500, Box::new(|w| w.widgets.code_entry.set_text("123456"))),
-        (9600, click("verify")),
-        (14500, click("install-next")),
+        (4000, click("sign-in")),
+        (12000, click("install-next")),
     ];
     for (delay, step) in script {
         let weak = Rc::downgrade(wizard);

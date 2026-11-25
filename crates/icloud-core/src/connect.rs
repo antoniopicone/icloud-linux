@@ -35,11 +35,16 @@ fn china_mainland() -> bool {
     std::env::var("ICLOUD_CHINA").is_ok_and(|v| v == "1")
 }
 
+/// Apple's production servers, in mainland China when `ICLOUD_CHINA=1`.
+pub fn endpoints() -> Endpoints {
+    Endpoints::production(china_mainland())
+}
+
 /// A client for the account in `config`, with its session stored under
 /// `cookie_dir`.
 pub fn client_for(config: &Config) -> Result<Client> {
     let mut client_config = ClientConfig::new(config.require_username()?, Some(config.cookie_dir.clone()));
-    client_config.endpoints = Endpoints::production(china_mainland());
+    client_config.endpoints = endpoints();
     Ok(Client::new(client_config)?)
 }
 

@@ -152,19 +152,18 @@ fn configure(ctx: &mut Context<'_>, email: Option<String>, store_password: bool)
 }
 
 fn authenticate_in_browser(ctx: &mut Context<'_>) -> Result<()> {
-    let config = load_config(ctx)?;
-    let client = client_for(&config)?;
+    load_config(ctx)?; // says to run `init` first when there is none
     ctx.ui.say("Opening a browser with a temporary profile…");
     let ui = &mut *ctx.ui;
-    browser::sign_in(&client, &mut || {
+    let info = browser::sign_in_and_save(&ctx.layout, &mut || {
         ui.say("Sign in to iCloud in the window that opened, and answer \"Trust this browser\" when Apple asks.");
         ui.say("Waiting for the sign-in to finish…");
     })?;
     ctx.ui.say("AUTH_OK");
-    if let Some(id) = client.account_info().apple_id {
+    if let Some(id) = &info.apple_id {
         ctx.ui.say(&format!("Authenticated as: {id}"));
     }
-    ctx.ui.say(&format!("Session saved under {}", config.cookie_dir.display()));
+    ctx.ui.say("The session is saved; no password is stored.");
     Ok(())
 }
 

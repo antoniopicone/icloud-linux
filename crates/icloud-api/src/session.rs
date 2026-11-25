@@ -241,12 +241,8 @@ impl Session {
     /// With `dir == None` nothing is read from or written to disk.
     pub fn open(account: &str, dir: Option<&Path>, home_origin: &str, new_client_id: &str) -> Result<Arc<Self>> {
         let persistence = dir.map(|dir| {
-            let stem: String = account.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
-            Persistence {
-                session_file: dir.join(format!("{stem}.session")),
-                cookie_file: dir.join(format!("{stem}.cookiejar")),
-                last_session: Mutex::new(String::new()),
-            }
+            let (session_file, cookie_file) = session_files(account, dir);
+            Persistence { session_file, cookie_file, last_session: Mutex::new(String::new()) }
         });
 
         let mut data = SessionData::default();
@@ -432,14 +428,27 @@ impl Session {
     pub fn flush(&self) -> Result<()> {
         let Some(p) = &self.persistence else { return Ok(()) };
         self.persist_data();
-        let mut buf = Vec::new();
-        {
-            let store = self.jar.lock().unwrap_or_else(PoisonError::into_inner);
-            cookie_store::serde::json::save_incl_expired_and_nonpersistent(&store, &mut buf)
-                .map_err(|e| Error::Protocol(format!("could not serialise cookies: {e}")))?;
-        }
-        write_private(&p.cookie_file, &buf)?;
+        write_private(&p.cookie_file, &self.cookie_bytes()?)?;
         Ok(())
+    }
+
+    /// Write this session to `dir` as the saved session of `account`, where
+    /// [`Session::open`] for that account will find it. For a sign-in whose
+    /// Apple ID is only known once Apple has answered.
+    pub fn save_as(&self, account: &str, dir: &Path) -> Result<()> {
+        let (session_file, cookie_file) = session_files(account, dir);
+        let json = serde_json::to_string(&*lock(&self.data))?;
+        write_private(&session_file, json.as_bytes())?;
+        write_private(&cookie_file, &self.cookie_bytes()?)?;
+        Ok(())
+    }
+
+    fn cookie_bytes(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        let store = self.jar.lock().unwrap_or_else(PoisonError::into_inner);
+        cookie_store::serde::json::save_incl_expired_and_nonpersistent(&store, &mut buf)
+            .map_err(|e| Error::Protocol(format!("could not serialise cookies: {e}")))?;
+        Ok(buf)
     }
 
     /// Forget everything, in memory and on disk.
@@ -463,6 +472,12 @@ impl Session {
     pub fn has_credentials(&self) -> bool {
         self.cookie("X-APPLE-WEBAUTH-TOKEN").is_some()
     }
+}
+
+/// Where the session of `account` is kept under `dir`.
+fn session_files(account: &str, dir: &Path) -> (PathBuf, PathBuf) {
+    let stem: String = account.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+    (dir.join(format!("{stem}.session")), dir.join(format!("{stem}.cookiejar")))
 }
 
 fn header_value(value: &str) -> Result<HeaderValue> {
@@ -677,6 +692,31 @@ mod tests {
         assert!(session.has_credentials());
         assert!(session.cookie("old").is_none());
         assert!(session.cookie("session-only").is_some());
+    }
+
+    #[test]
+    fn an_unsaved_session_can_be_saved_under_an_account_found_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let temporary = Session::open("unknown", None, "https://www.icloud.com", "cid-1").unwrap();
+        let cookie = BrowserCookie {
+            name: "X-APPLE-WEBAUTH-TOKEN".into(),
+            value: "v".into(),
+            domain: ".icloud.com".into(),
+            path: "/".into(),
+            secure: true,
+            http_only: true,
+            expires: Some(4_102_444_800.0),
+        };
+        temporary.import_cookies(&[cookie]);
+        temporary.update_data(|d| d.trust_token = Some("trust".into()));
+        temporary.save_as("me@example.com", dir.path()).unwrap();
+
+        let reopened = Session::open("me@example.com", Some(dir.path()), "https://www.icloud.com", "cid-2").unwrap();
+        assert!(reopened.has_credentials());
+        assert_eq!(reopened.data().trust_token.as_deref(), Some("trust"));
+        assert_eq!(reopened.data().client_id.as_deref(), Some("cid-1"));
+        let mode = fs::metadata(dir.path().join("meexamplecom.cookiejar")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

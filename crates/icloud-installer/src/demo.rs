@@ -56,12 +56,6 @@ impl Authenticator for DemoAuth {
         }
     }
 
-    fn login_in_browser(&mut self, opened: &mut dyn FnMut()) -> Result<(), String> {
-        opened();
-        thread::sleep(Duration::from_millis(1500));
-        Ok(())
-    }
-
     fn account(&self) -> AccountInfo {
         AccountInfo { apple_id: Some("demo@icloud.com".into()), full_name: Some("Demo User".into()) }
     }
@@ -83,6 +77,12 @@ impl Backend for DemoBackend {
 
     fn save_account(&self, _: &str, _: Option<SecretString>) -> Result<()> {
         Ok(())
+    }
+
+    fn sign_in_with_browser(&self) -> Result<AccountInfo> {
+        // Long enough to see the waiting message.
+        thread::sleep(Duration::from_millis(2500));
+        Ok(AccountInfo { apple_id: Some("demo@icloud.com".into()), full_name: Some("Demo User".into()) })
     }
 
     fn authenticator(&self) -> Result<Box<dyn Authenticator>> {

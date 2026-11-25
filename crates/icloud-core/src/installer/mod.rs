@@ -15,6 +15,7 @@ use std::{
 };
 
 pub use auth_worker::{AuthEvent, AuthRequest, AuthWorker, Authenticator, Channel, MAX_CODE_ATTEMPTS};
+use icloud_api::AccountInfo;
 use secrecy::SecretString;
 
 use crate::{
@@ -93,6 +94,10 @@ pub trait Backend: Send + Sync {
     fn save_account(&self, username: &str, password: Option<SecretString>) -> Result<()>;
     /// The object that signs in (`icloudctl auth`).
     fn authenticator(&self) -> Result<Box<dyn Authenticator>>;
+    /// `icloudctl auth --from-browser`: the person signs in on icloud.com in
+    /// a browser window; the session and the Apple ID are saved. Blocks until
+    /// they are done (at most [`crate::browser::SIGN_IN_TIMEOUT`]).
+    fn sign_in_with_browser(&self) -> Result<AccountInfo>;
     /// `icloudctl start`, plus the optional extras.
     fn finish(&self, plan: &InstallPlan, mount_dir: &Path) -> Vec<StepOutcome>;
 }
@@ -149,6 +154,10 @@ impl Backend for SystemBackend {
 
     fn authenticator(&self) -> Result<Box<dyn Authenticator>> {
         Ok(Box::new(client_for(&self.config()?)?))
+    }
+
+    fn sign_in_with_browser(&self) -> Result<AccountInfo> {
+        crate::browser::sign_in_and_save(&self.layout, &mut || {})
     }
 
     fn finish(&self, plan: &InstallPlan, mount_dir: &Path) -> Vec<StepOutcome> {
@@ -212,21 +221,15 @@ pub fn wait_until_mounted(mount: &Path, timeout: Duration) -> bool {
 
 /// Check what the user typed before anything is done with it.
 pub fn validate_account(username: &str, password: &str) -> std::result::Result<(), &'static str> {
-    validate_apple_id(username)?;
-    if password.is_empty() {
-        return Err("Enter your Apple ID password.");
-    }
-    Ok(())
-}
-
-/// The Apple ID alone, for a sign-in where the password is typed elsewhere.
-pub fn validate_apple_id(username: &str) -> std::result::Result<(), &'static str> {
     let username = username.trim();
     if username.is_empty() {
         return Err("Enter your Apple ID.");
     }
     if username.contains(char::is_whitespace) {
         return Err("An Apple ID is an email address or phone number, without spaces.");
+    }
+    if password.is_empty() {
+        return Err("Enter your Apple ID password.");
     }
     Ok(())
 }

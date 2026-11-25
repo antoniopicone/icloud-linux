@@ -1,15 +1,16 @@
-//! Sign-in through a browser (`icloudctl auth --from-browser`, the installer's button): sign in on icloud.com in a real browser
-//! and take the trust cookie from it.
+//! Sign-in through a browser (`icloudctl auth --from-browser`, the installer):
+//! the person signs in on icloud.com in a real browser window.
+//!
+//! The Apple ID, the password and the verification code are typed into
+//! Apple's own page; this program never sees them. What it takes is the
+//! browser's Apple cookies, which Apple then checks
+//! (`Client::adopt_browser_session`). The Apple ID comes from Apple's answer.
 //!
 //! Apple keeps its cookies `HttpOnly`, so they cannot be read from a page. A
 //! Chromium-family browser is therefore started with a throw-away profile and
-//! a debugging port on `127.0.0.1` that it picks itself; the cookie is read
+//! a debugging port on `127.0.0.1` that it picks itself; the cookies are read
 //! from that profile only and the profile is deleted afterwards. Nothing from
 //! the person's own browser profile is touched.
-//!
-//! The person types their password and code into Apple's own page; this
-//! program never sees them. What it takes is the browser's session cookies,
-//! which Apple then checks (`Client::adopt_browser_session`).
 
 use std::{
     fs,
@@ -19,33 +20,55 @@ use std::{
     time::{Duration, Instant},
 };
 
-use icloud_api::{BrowserCookie, Client};
-
-use crate::{Error, Result};
+use icloud_api::{AccountInfo, BrowserCookie, Client, ClientConfig};
 use serde_json::{Value, json};
+
+use crate::{Config, Error, Layout, Result, connect, setup};
 
 const TRUST_COOKIE: &str = "X-APPLE-WEBAUTH-HSA-TRUST";
 const SESSION_COOKIE: &str = "X-APPLE-WEBAUTH-TOKEN";
 const START_URL: &str = "https://www.icloud.com/";
-const BROWSERS: [&str; 7] = [
+/// Chromium-based browsers, by the names their packages put on `PATH`.
+const BROWSERS: &[&str] = &[
     "chromium",
     "chromium-browser",
     "google-chrome",
     "google-chrome-stable",
     "brave-browser",
+    "brave-browser-stable",
+    "brave",
+    "brave-origin",
+    "brave-origin-stable",
     "microsoft-edge",
+    "microsoft-edge-stable",
     "vivaldi",
+    "vivaldi-stable",
+    "opera",
 ];
+/// The system's default-browser links, used when none of the above is found.
+const DEFAULT_BROWSER_LINKS: &[&str] = &["x-www-browser", "gnome-www-browser"];
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_EVERY: Duration = Duration::from_secs(2);
 
-/// The browser to start: `$ICLOUD_BROWSER` if set, else the first known one on `PATH`.
+/// The browser to start: `$ICLOUD_BROWSER` if set, else the first known one on
+/// `PATH`, else the system default browser if it is Chromium-based.
 pub fn find_browser() -> Option<PathBuf> {
     if let Some(custom) = std::env::var_os("ICLOUD_BROWSER").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(custom));
     }
     let path = std::env::var_os("PATH")?;
-    BROWSERS.iter().find_map(|name| std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file()))
+    let on_path = |name: &str| std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file());
+    BROWSERS.iter().find_map(|name| on_path(name)).or_else(|| {
+        DEFAULT_BROWSER_LINKS
+            .iter()
+            .filter_map(|name| on_path(name))
+            .find(|link| fs::canonicalize(link).is_ok_and(|target| is_chromium_based(&target)))
+    })
+}
+
+fn is_chromium_based(binary: &Path) -> bool {
+    let name = binary.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    ["chrom", "brave", "edge", "vivaldi", "opera"].iter().any(|family| name.contains(family))
 }
 
 /// A browser window open on icloud.com, with a throw-away profile. Dropping it
@@ -68,30 +91,49 @@ impl BrowserSignIn {
     }
 
     /// Wait for the person to sign in and trust the browser; returns the
-    /// browser's cookies.
+    /// browser's Apple cookies.
     pub fn wait_for_session(&self, timeout: Duration) -> Result<Vec<BrowserCookie>> {
         wait_for_cookie(&self.ws_url, timeout)
     }
 }
 
-/// Sign in through a browser window and have `client` adopt the session.
-/// `opened` is called once the window is up, before the long wait.
-pub fn sign_in(client: &Client, opened: &mut dyn FnMut()) -> Result<()> {
+/// The whole browser sign-in: open icloud.com, wait for the person to sign in,
+/// have Apple confirm the session, then save it and the Apple ID it belongs
+/// to in the configuration under `layout` (which must exist: `init` first).
+///
+/// `opened` is called once the window is up, before the long wait. Any stored
+/// password is dropped: it would belong to a sign-in this one replaces.
+pub fn sign_in_and_save(layout: &Layout, opened: &mut dyn FnMut()) -> Result<AccountInfo> {
+    let config = Config::load(&layout.config_file(), layout)?;
     let path = require_browser()?;
     let window = BrowserSignIn::start(&path)?;
     opened();
     let cookies = window.wait_for_session(SIGN_IN_TIMEOUT)?;
     drop(window); // close the browser before talking to Apple
+
+    // The Apple ID is not known yet, so the session starts in memory and is
+    // written under the right name once Apple has said whose it is.
+    let mut client_config = ClientConfig::new("browser-sign-in", None);
+    client_config.endpoints = connect::endpoints();
+    let client = Client::new(client_config)?;
     client.adopt_browser_session(&cookies)?;
-    Ok(())
+    let info = client.account_info();
+    let apple_id = info
+        .apple_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| Error::Setup("Apple accepted the sign-in but did not say which Apple ID it is".into()))?;
+    client.session().save_as(&apple_id, &config.cookie_dir)?;
+    setup::configure(layout, &apple_id, None)?;
+    Ok(info)
 }
 
 /// [`find_browser`] with the error to show when there is none.
 pub fn require_browser() -> Result<PathBuf> {
     find_browser().ok_or_else(|| {
         Error::Setup(
-            "no Chromium-based browser found (chromium, google-chrome, brave-browser, microsoft-edge). \
-             Install one, or set ICLOUD_BROWSER to its path"
+            "No Chromium-based browser was found (Chromium, Chrome, Brave, Edge, Vivaldi). \
+             Install one, or set ICLOUD_BROWSER to its path."
                 .into(),
         )
     })
@@ -117,12 +159,21 @@ fn spawn(browser: &Path, profile: &Path) -> Result<Child> {
         .arg("--remote-debugging-port=0")
         .args(["--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check"])
         .arg("--password-store=basic")
+        // A sign-in page needs no GPU rasterisation, and on some young GPU
+        // drivers it is what hangs the GPU.
+        .arg("--disable-gpu-rasterization")
+        .args(extra_args())
         .arg(START_URL)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|err| Error::Setup(format!("could not start {}: {err}", browser.display())))
+}
+
+/// `$ICLOUD_BROWSER_ARGS`: extra flags for the browser, separated by spaces.
+fn extra_args() -> Vec<String> {
+    std::env::var("ICLOUD_BROWSER_ARGS").unwrap_or_default().split_whitespace().map(str::to_owned).collect()
 }
 
 /// The browser writes its chosen port and socket path to `DevToolsActivePort`.
@@ -216,6 +267,16 @@ mod tests {
     use std::{net::TcpListener, thread};
 
     use super::*;
+
+    #[test]
+    fn chromium_family_binaries_are_recognised_by_name() {
+        for yes in ["/opt/brave.com/brave-origin/brave-origin", "/usr/bin/chromium", "/opt/google/chrome/chrome"] {
+            assert!(is_chromium_based(Path::new(yes)), "{yes}");
+        }
+        for no in ["/usr/lib/firefox/firefox", "/usr/bin/epiphany", "/usr/bin/lynx"] {
+            assert!(!is_chromium_based(Path::new(no)), "{no}");
+        }
+    }
 
     #[test]
     fn the_active_port_file_gives_the_socket_address() {
