@@ -169,6 +169,7 @@ struct Widgets {
     account_message: gtk::Label,
     account_busy: Busy,
     sign_in: gtk::Button,
+    sign_in_browser: gtk::Button,
     // verify
     device: gtk::CheckButton,
     sms: gtk::CheckButton,
@@ -345,7 +346,11 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     account.append(&account_busy.row);
     let account_back = gtk::Button::with_label("Back");
     let sign_in = primary("Sign in");
-    account.append(&button_row(&[&account_back, &sign_in]));
+    let sign_in_browser = gtk::Button::with_label("Sign in on icloud.com…");
+    sign_in_browser.set_tooltip_text(Some(
+        "Opens a browser window where you sign in on icloud.com and trust it, so no verification code is needed. Your password is still asked for here.",
+    ));
+    account.append(&button_row(&[&account_back, &sign_in_browser, &sign_in]));
     stack.add_named(&account, Some("account"));
 
     // verify
@@ -424,6 +429,7 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     welcome_next.set_widget_name("welcome-next");
     folder_next.set_widget_name("folder-next");
     sign_in.set_widget_name("sign-in");
+    sign_in_browser.set_widget_name("sign-in-browser");
     send_code.set_widget_name("send-code");
     verify_button.set_widget_name("verify");
     install_next.set_widget_name("install-next");
@@ -446,6 +452,7 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
         account_message,
         account_busy,
         sign_in,
+        sign_in_browser,
         device,
         sms,
         phones,
@@ -612,6 +619,14 @@ impl Wizard {
 
     // account
     fn sign_in(self: &Rc<Self>) {
+        self.start_sign_in(false);
+    }
+
+    fn sign_in_with_browser(self: &Rc<Self>) {
+        self.start_sign_in(true);
+    }
+
+    fn start_sign_in(self: &Rc<Self>, via_browser: bool) {
         let w = &self.widgets;
         let (username, password) = (w.username.text().to_string(), w.password.text().to_string());
         if let Err(problem) = validate_account(&username, &password) {
@@ -620,7 +635,8 @@ impl Wizard {
         }
         Self::show_note(&w.account_message, "");
         w.sign_in.set_sensitive(false);
-        w.account_busy.show("Signing in…");
+        w.sign_in_browser.set_sensitive(false);
+        w.account_busy.show(if via_browser { "Opening the browser…" } else { "Signing in…" });
         let remember = w.remember.is_active();
         self.plan.borrow_mut().remember_password = remember;
 
@@ -637,9 +653,12 @@ impl Wizard {
                 match result {
                     Ok(auth) => {
                         let worker = AuthWorker::spawn(auth);
-                        worker.request(AuthRequest::Login(SecretString::from(
-                            wizard.widgets.password.text().to_string(),
-                        )));
+                        let password = SecretString::from(wizard.widgets.password.text().to_string());
+                        worker.request(if via_browser {
+                            AuthRequest::LoginViaBrowser(password)
+                        } else {
+                            AuthRequest::Login(password)
+                        });
                         *wizard.worker.borrow_mut() = Some(worker);
                     }
                     Err(err) => wizard.account_failed(&err.to_string()),
@@ -652,6 +671,7 @@ impl Wizard {
         let w = &self.widgets;
         w.account_busy.hide();
         w.sign_in.set_sensitive(true);
+        w.sign_in_browser.set_sensitive(true);
         Self::show_error(&w.account_message, message);
     }
 
@@ -735,10 +755,14 @@ impl Wizard {
                 w.verify_busy.hide();
                 self.go("install");
             }
+            AuthEvent::BrowserOpened => {
+                w.account_busy.show("Sign in on icloud.com in the browser window, and choose “Trust this browser”…");
+            }
             AuthEvent::CodeNeeded(options) => {
                 *self.options.borrow_mut() = options;
                 w.account_busy.hide();
                 w.sign_in.set_sensitive(true);
+                w.sign_in_browser.set_sensitive(true);
                 self.go("verify");
             }
             AuthEvent::SmsSent { to } => {
@@ -785,6 +809,7 @@ impl Wizard {
         let w = &self.widgets;
         w.code_entry.set_sensitive(true);
         w.sign_in.set_sensitive(true);
+        w.sign_in_browser.set_sensitive(true);
         w.account_busy.hide();
         Self::show_note(&w.account_message, "");
         self.go("account");
@@ -934,6 +959,7 @@ fn wire(wizard: &Rc<Wizard>) {
     on("folder-next", Box::new(Wizard::continue_from_folder), weak(wizard));
     on("account-back", Box::new(|w| w.go("folder")), weak(wizard));
     on("sign-in", Box::new(Wizard::sign_in), weak(wizard));
+    on("sign-in-browser", Box::new(Wizard::sign_in_with_browser), weak(wizard));
     on("verify-back", Box::new(Wizard::start_over), weak(wizard));
     on("send-code", Box::new(|w| w.send_sms()), weak(wizard));
     on("verify", Box::new(|w| w.verify()), weak(wizard));

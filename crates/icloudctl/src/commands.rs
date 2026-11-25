@@ -7,18 +7,16 @@ use std::{
     time::Duration,
 };
 
-use icloud_core::{Config, Error, Layout, Result, connect::client_for, hydrate, setup, setup::Systemctl, sync_request};
+use icloud_core::{
+    Config, Error, Layout, Result, browser, connect::client_for, hydrate, setup, setup::Systemctl, sync_request,
+};
 use secrecy::SecretString;
 
 use crate::{
     auth::{self, AuthOptions},
-    browser,
     cli::Command,
     prompt::{Prompter, confirm},
 };
-
-/// How long to wait for the person to finish signing in on icloud.com.
-const BROWSER_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[allow(missing_debug_implementations)]
 pub struct Context<'a> {
@@ -44,11 +42,7 @@ pub fn run(command: Command, ctx: &mut Context<'_>) -> Result<()> {
         Command::Init { mount_dir } => init(ctx, mount_dir),
         Command::Configure { email, store_password } => configure(ctx, email, store_password),
         Command::Auth { force_sms, trust_token, from_browser, debug } => {
-            let trust_token = if from_browser {
-                Some(browser::trust_token_from_browser(ctx.ui, BROWSER_SIGN_IN_TIMEOUT)?)
-            } else {
-                trust_token
-            };
+            let trust_token = if from_browser { Some(trust_token_from_browser(ctx.ui)?) } else { trust_token };
             authenticate(ctx, &AuthOptions { force_sms, trust_token, debug })
         }
         Command::Start => {
@@ -153,6 +147,17 @@ fn configure(ctx: &mut Context<'_>, email: Option<String>, store_password: bool)
         ctx.ui.say("The password is not stored; you will be asked for it when you sign in.");
     }
     Ok(())
+}
+
+fn trust_token_from_browser(ui: &mut dyn Prompter) -> Result<String> {
+    let path = browser::require_browser()?;
+    ui.say(&format!("Opening {} with a temporary profile…", path.display()));
+    let window = browser::BrowserSignIn::start(&path)?;
+    ui.say("Sign in to iCloud in the window that opened, and answer \"Trust this browser\" when Apple asks.");
+    ui.say("Waiting for the sign-in to finish…");
+    let token = window.wait_for_trust_token(browser::SIGN_IN_TIMEOUT)?;
+    ui.say("Trust cookie received; closing the browser.");
+    Ok(token)
 }
 
 fn authenticate(ctx: &mut Context<'_>, options: &AuthOptions) -> Result<()> {

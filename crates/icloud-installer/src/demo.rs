@@ -56,6 +56,14 @@ impl Authenticator for DemoAuth {
         }
     }
 
+    fn set_trust_token(&mut self, _: &str) {}
+
+    fn trust_token_from_browser(&mut self, opened: &mut dyn FnMut()) -> Result<String, String> {
+        opened();
+        thread::sleep(Duration::from_millis(1500));
+        Ok("demo-trust-token".into())
+    }
+
     fn account(&self) -> AccountInfo {
         AccountInfo { apple_id: Some("demo@icloud.com".into()), full_name: Some("Demo User".into()) }
     }

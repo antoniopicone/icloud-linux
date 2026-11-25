@@ -4,6 +4,7 @@
 //! Nothing in here touches FUSE or a GUI toolkit, so all of it is testable
 //! with the in-memory Drive from `icloud-api`.
 
+pub mod browser;
 pub mod config;
 pub mod connect;
 pub mod dirs;

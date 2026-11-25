@@ -1,4 +1,4 @@
-//! `icloudctl auth --from-browser`: sign in on icloud.com in a real browser
+//! Sign-in through a browser (`icloudctl auth --from-browser`, the installer's button): sign in on icloud.com in a real browser
 //! and take the trust cookie from it.
 //!
 //! Apple keeps its cookies `HttpOnly`, so they cannot be read from a page. A
@@ -18,10 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use icloud_core::{Error, Result};
+use crate::{Error, Result};
 use serde_json::{Value, json};
-
-use crate::prompt::Prompter;
 
 const TRUST_COOKIE: &str = "X-APPLE-WEBAUTH-HSA-TRUST";
 const START_URL: &str = "https://www.icloud.com/";
@@ -46,30 +44,49 @@ pub fn find_browser() -> Option<PathBuf> {
     BROWSERS.iter().find_map(|name| std::env::split_paths(&path).map(|dir| dir.join(name)).find(|c| c.is_file()))
 }
 
-/// Open icloud.com in a browser, wait for the person to sign in and trust it,
-/// and return the value of the trust cookie.
-pub fn trust_token_from_browser(ui: &mut dyn Prompter, timeout: Duration) -> Result<String> {
-    let browser = find_browser().ok_or_else(|| {
+/// A browser window open on icloud.com, with a throw-away profile. Dropping it
+/// closes the browser and deletes the profile.
+#[derive(Debug)]
+pub struct BrowserSignIn {
+    // Field order matters: the browser must stop before its profile goes.
+    _process: BrowserProcess,
+    _profile: tempfile::TempDir,
+    ws_url: String,
+}
+
+impl BrowserSignIn {
+    /// Open icloud.com in `browser`.
+    pub fn start(browser: &Path) -> Result<Self> {
+        let profile = tempfile::Builder::new().prefix("icloud-linux-browser-").tempdir()?;
+        let mut process = BrowserProcess(spawn(browser, profile.path())?);
+        let ws_url = debugging_endpoint(profile.path(), &mut process.0)?;
+        Ok(Self { _process: process, _profile: profile, ws_url })
+    }
+
+    /// Wait for the person to sign in and trust the browser; returns the value
+    /// of the trust cookie.
+    pub fn wait_for_trust_token(&self, timeout: Duration) -> Result<String> {
+        wait_for_cookie(&self.ws_url, timeout)
+    }
+}
+
+/// [`find_browser`] with the error to show when there is none.
+pub fn require_browser() -> Result<PathBuf> {
+    find_browser().ok_or_else(|| {
         Error::Setup(
             "no Chromium-based browser found (chromium, google-chrome, brave-browser, microsoft-edge). \
              Install one, set ICLOUD_BROWSER to its path, or copy the trust cookie by hand: \
              `icloudctl auth --trust-token <value>`"
                 .into(),
         )
-    })?;
-    let profile = tempfile::Builder::new().prefix("icloud-linux-browser-").tempdir()?;
-    ui.say(&format!("Opening {} with a temporary profile…", browser.display()));
-    let mut child = BrowserProcess(spawn(&browser, profile.path())?);
-
-    let ws_url = debugging_endpoint(profile.path(), &mut child.0)?;
-    ui.say("Sign in to iCloud in the window that opened, and answer \"Trust this browser\" when Apple asks.");
-    ui.say("Waiting for the sign-in to finish…");
-    let token = wait_for_cookie(&ws_url, timeout)?;
-    ui.say("Trust cookie received; closing the browser.");
-    Ok(token)
+    })
 }
 
+/// How long to wait for the person to finish signing in on icloud.com.
+pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// Kills the browser when dropped, so no path leaves it running.
+#[derive(Debug)]
 struct BrowserProcess(Child);
 
 impl Drop for BrowserProcess {
