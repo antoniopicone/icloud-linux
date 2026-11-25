@@ -123,6 +123,56 @@ impl SessionData {
     }
 }
 
+/// A cookie taken from a browser the person signed in with.
+#[derive(Clone, PartialEq)]
+pub struct BrowserCookie {
+    pub name: String,
+    pub value: String,
+    /// As the browser reports it: a leading dot means "and subdomains".
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    /// Seconds since the Unix epoch; `None` for a session cookie.
+    pub expires: Option<f64>,
+}
+
+impl std::fmt::Debug for BrowserCookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserCookie").field("name", &self.name).field("domain", &self.domain).finish_non_exhaustive()
+    }
+}
+
+impl BrowserCookie {
+    /// The `Set-Cookie` line that recreates this cookie, and the address it
+    /// came from.
+    fn set_cookie(&self, now: f64) -> Option<(String, reqwest::Url)> {
+        let host = self.domain.trim_start_matches('.');
+        let url = reqwest::Url::parse(&format!("https://{host}/")).ok()?;
+        let mut line =
+            format!("{}={}; Path={}", self.name, self.value, if self.path.is_empty() { "/" } else { &self.path });
+        if self.domain.starts_with('.') {
+            line.push_str("; Domain=");
+            line.push_str(host);
+        }
+        if let Some(expires) = self.expires {
+            let left = expires - now;
+            if left <= 0.0 {
+                return None; // already expired
+            }
+            line.push_str("; Max-Age=");
+            line.push_str(&(left as u64).to_string());
+        }
+        if self.secure {
+            line.push_str("; Secure");
+        }
+        if self.http_only {
+            line.push_str("; HttpOnly");
+        }
+        Some((line, url))
+    }
+}
+
 /// A fully buffered response whose HTTP and API-level status were checked.
 #[derive(Debug)]
 pub struct ApiResponse {
@@ -253,6 +303,13 @@ impl Session {
     pub fn cookie(&self, name: &str) -> Option<String> {
         let store = self.jar.lock().unwrap_or_else(PoisonError::into_inner);
         store.iter_unexpired().find(|c| c.name() == name && !c.value().is_empty()).map(|c| c.value().to_owned())
+    }
+
+    /// Add cookies taken from a browser. Returns how many were accepted.
+    pub fn import_cookies(&self, cookies: &[BrowserCookie]) -> usize {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        let mut store = self.jar.lock().unwrap_or_else(PoisonError::into_inner);
+        cookies.iter().filter_map(|c| c.set_cookie(now)).filter(|(line, url)| store.parse(line, url).is_ok()).count()
     }
 
     /// Send a request and normalise the outcome. The body is buffered.
@@ -401,9 +458,10 @@ impl Session {
         }
     }
 
-    /// True when a session token and the cookie that goes with it are stored.
+    /// True when the cookie Apple's web services recognise a session by is
+    /// stored. A browser sign-in provides that cookie but no session token.
     pub fn has_credentials(&self) -> bool {
-        lock(&self.data).session_token.is_some() && self.cookie("X-APPLE-WEBAUTH-TOKEN").is_some()
+        self.cookie("X-APPLE-WEBAUTH-TOKEN").is_some()
     }
 }
 
@@ -594,6 +652,31 @@ mod tests {
 
         again.clear();
         assert!(!session_file.exists());
+    }
+
+    #[test]
+    fn cookies_from_a_browser_make_a_session_and_expired_ones_are_dropped() {
+        let session = Session::open("me.com", None, "https://www.icloud.com", "cid").unwrap();
+        assert!(!session.has_credentials());
+        let cookie = |name: &str, expires: Option<f64>| BrowserCookie {
+            name: name.into(),
+            value: "v".into(),
+            domain: ".icloud.com".into(),
+            path: "/".into(),
+            secure: true,
+            http_only: true,
+            expires,
+        };
+        let far = 4_102_444_800.0;
+        let taken = session.import_cookies(&[
+            cookie("X-APPLE-WEBAUTH-TOKEN", Some(far)),
+            cookie("old", Some(1.0)),
+            cookie("session-only", None),
+        ]);
+        assert_eq!(taken, 2);
+        assert!(session.has_credentials());
+        assert!(session.cookie("old").is_none());
+        assert!(session.cookie("session-only").is_some());
     }
 
     #[test]

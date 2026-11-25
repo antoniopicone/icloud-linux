@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 use crate::{
     drive::HttpDrive,
     error::{Error, Result},
-    session::{CT_JSON, Session, USER_AGENT},
+    session::{BrowserCookie, CT_JSON, Session, USER_AGENT},
     srp::{Protocol, SrpClient, derive_password},
     twofactor::{TrustedPhone, TwoFactorOptions, parse_boot_args},
 };
@@ -169,6 +169,24 @@ impl Client {
     /// skips the verification code.
     pub fn set_trust_token(&self, token: &str) {
         self.session.update_data(|d| d.trust_token = Some(token.trim().to_owned()));
+    }
+
+    /// Continue from a sign-in made in a browser: take its cookies, then
+    /// check with Apple that they make a trusted session. No password and no
+    /// code are involved, so nothing here can count towards a lockout.
+    ///
+    /// The session is then the browser's own, saved like any other.
+    pub fn adopt_browser_session(&self, cookies: &[BrowserCookie]) -> Result<()> {
+        if let Some(trust) = cookies.iter().find(|c| c.name == "X-APPLE-WEBAUTH-HSA-TRUST" && !c.value.is_empty()) {
+            self.set_trust_token(&trust.value);
+        }
+        self.session.import_cookies(cookies);
+        self.resume().map_err(|err| match err {
+            Error::Http(_) => err,
+            other => Error::LoginFailed(format!("Apple did not accept the browser's session ({other})")),
+        })?;
+        self.flush();
+        Ok(())
     }
 
     /// Forget the stored session, locally only.

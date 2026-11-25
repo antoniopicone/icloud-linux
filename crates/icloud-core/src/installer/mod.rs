@@ -212,15 +212,21 @@ pub fn wait_until_mounted(mount: &Path, timeout: Duration) -> bool {
 
 /// Check what the user typed before anything is done with it.
 pub fn validate_account(username: &str, password: &str) -> std::result::Result<(), &'static str> {
+    validate_apple_id(username)?;
+    if password.is_empty() {
+        return Err("Enter your Apple ID password.");
+    }
+    Ok(())
+}
+
+/// The Apple ID alone, for a sign-in where the password is typed elsewhere.
+pub fn validate_apple_id(username: &str) -> std::result::Result<(), &'static str> {
     let username = username.trim();
     if username.is_empty() {
         return Err("Enter your Apple ID.");
     }
     if username.contains(char::is_whitespace) {
         return Err("An Apple ID is an email address or phone number, without spaces.");
-    }
-    if password.is_empty() {
-        return Err("Enter your Apple ID password.");
     }
     Ok(())
 }

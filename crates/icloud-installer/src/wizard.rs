@@ -20,7 +20,7 @@ use icloud_core::{
     config::CrawlMode,
     installer::{
         AuthEvent, AuthRequest, AuthWorker, Backend, Channel, InstallPlan, MAX_CODE_ATTEMPTS, Prepared, StepOutcome,
-        code_is_complete, validate_account, validate_mount_dir,
+        code_is_complete, validate_account, validate_apple_id, validate_mount_dir,
     },
     setup::Severity,
 };
@@ -345,12 +345,16 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     let account_busy = Busy::new();
     account.append(&account_busy.row);
     let account_back = gtk::Button::with_label("Back");
-    let sign_in = primary("Sign in");
-    let sign_in_browser = gtk::Button::with_label("Sign in on icloud.com…");
-    sign_in_browser.set_tooltip_text(Some(
-        "Opens a browser window where you sign in on icloud.com and trust it, so no verification code is needed. Your password is still asked for here.",
+    let sign_in = gtk::Button::with_label("Use my password here instead");
+    sign_in.set_tooltip_text(Some(
+        "Type the password in this window. It goes straight to Apple, and you can choose to remember it.",
     ));
-    account.append(&button_row(&[&account_back, &sign_in_browser, &sign_in]));
+    let sign_in_browser = primary("Sign in on icloud.com");
+    account.append(&label(
+        "Recommended: sign in on Apple's own page in a browser window. Your password and code are typed there and never reach this app. Only your Apple ID is needed here.",
+        &["note-text"],
+    ));
+    account.append(&button_row(&[&account_back, &sign_in, &sign_in_browser]));
     stack.add_named(&account, Some("account"));
 
     // verify
@@ -629,7 +633,8 @@ impl Wizard {
     fn start_sign_in(self: &Rc<Self>, via_browser: bool) {
         let w = &self.widgets;
         let (username, password) = (w.username.text().to_string(), w.password.text().to_string());
-        if let Err(problem) = validate_account(&username, &password) {
+        let valid = if via_browser { validate_apple_id(&username) } else { validate_account(&username, &password) };
+        if let Err(problem) = valid {
             Self::show_error(&w.account_message, problem);
             return;
         }
@@ -637,7 +642,8 @@ impl Wizard {
         w.sign_in.set_sensitive(false);
         w.sign_in_browser.set_sensitive(false);
         w.account_busy.show(if via_browser { "Opening the browser…" } else { "Signing in…" });
-        let remember = w.remember.is_active();
+        // Nothing typed here is kept when the password is typed in the browser.
+        let remember = w.remember.is_active() && !via_browser;
         self.plan.borrow_mut().remember_password = remember;
 
         let backend = Arc::clone(&self.backend);
@@ -653,11 +659,10 @@ impl Wizard {
                 match result {
                     Ok(auth) => {
                         let worker = AuthWorker::spawn(auth);
-                        let password = SecretString::from(wizard.widgets.password.text().to_string());
                         worker.request(if via_browser {
-                            AuthRequest::LoginViaBrowser(password)
+                            AuthRequest::LoginViaBrowser
                         } else {
-                            AuthRequest::Login(password)
+                            AuthRequest::Login(SecretString::from(wizard.widgets.password.text().to_string()))
                         });
                         *wizard.worker.borrow_mut() = Some(worker);
                     }

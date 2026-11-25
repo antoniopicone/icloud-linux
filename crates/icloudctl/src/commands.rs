@@ -42,7 +42,9 @@ pub fn run(command: Command, ctx: &mut Context<'_>) -> Result<()> {
         Command::Init { mount_dir } => init(ctx, mount_dir),
         Command::Configure { email, store_password } => configure(ctx, email, store_password),
         Command::Auth { force_sms, trust_token, from_browser, debug } => {
-            let trust_token = if from_browser { Some(trust_token_from_browser(ctx.ui)?) } else { trust_token };
+            if from_browser {
+                return authenticate_in_browser(ctx);
+            }
             authenticate(ctx, &AuthOptions { force_sms, trust_token, debug })
         }
         Command::Start => {
@@ -149,15 +151,21 @@ fn configure(ctx: &mut Context<'_>, email: Option<String>, store_password: bool)
     Ok(())
 }
 
-fn trust_token_from_browser(ui: &mut dyn Prompter) -> Result<String> {
-    let path = browser::require_browser()?;
-    ui.say(&format!("Opening {} with a temporary profile…", path.display()));
-    let window = browser::BrowserSignIn::start(&path)?;
-    ui.say("Sign in to iCloud in the window that opened, and answer \"Trust this browser\" when Apple asks.");
-    ui.say("Waiting for the sign-in to finish…");
-    let token = window.wait_for_trust_token(browser::SIGN_IN_TIMEOUT)?;
-    ui.say("Trust cookie received; closing the browser.");
-    Ok(token)
+fn authenticate_in_browser(ctx: &mut Context<'_>) -> Result<()> {
+    let config = load_config(ctx)?;
+    let client = client_for(&config)?;
+    ctx.ui.say("Opening a browser with a temporary profile…");
+    let ui = &mut *ctx.ui;
+    browser::sign_in(&client, &mut || {
+        ui.say("Sign in to iCloud in the window that opened, and answer \"Trust this browser\" when Apple asks.");
+        ui.say("Waiting for the sign-in to finish…");
+    })?;
+    ctx.ui.say("AUTH_OK");
+    if let Some(id) = client.account_info().apple_id {
+        ctx.ui.say(&format!("Authenticated as: {id}"));
+    }
+    ctx.ui.say(&format!("Session saved under {}", config.cookie_dir.display()));
+    Ok(())
 }
 
 fn authenticate(ctx: &mut Context<'_>, options: &AuthOptions) -> Result<()> {

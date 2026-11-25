@@ -21,7 +21,7 @@ pub mod memory;
 pub use client::{AccountInfo, Client, ClientConfig, Endpoints, LoginStatus};
 pub use drive::{DeleteMode, Drive, HttpDrive, Node, NodeKind};
 pub use error::{Error, Result};
-pub use session::Session;
+pub use session::{BrowserCookie, Session};
 pub use twofactor::{CodeMethod, TrustedPhone, TwoFactorOptions};
 
 /// A random (version 4) UUID in its canonical lower-case form.

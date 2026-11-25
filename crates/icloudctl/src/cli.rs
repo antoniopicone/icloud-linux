@@ -45,9 +45,10 @@ pub enum Command {
         /// Import a `X-APPLE-WEBAUTH-HSA-TRUST` value from a signed-in browser.
         #[arg(long, value_name = "TOKEN")]
         trust_token: Option<String>,
-        /// Sign in on icloud.com in a browser window instead of typing a code.
-        /// The password is still asked for. Needs a Chromium-based browser.
-        #[arg(long, conflicts_with = "trust_token")]
+        /// Sign in on icloud.com in a browser window instead of here: the
+        /// password and the code are typed on Apple's page and never reach
+        /// this program. Needs a Chromium-based browser.
+        #[arg(long, conflicts_with_all = ["trust_token", "force_sms"])]
         from_browser: bool,
         /// Show what Apple reported about the challenge, and enable `--verbose`.
         #[arg(long)]

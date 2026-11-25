@@ -7,7 +7,7 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use httpmock::prelude::*;
-use icloud_api::{Client, ClientConfig, Endpoints, Error, LoginStatus};
+use icloud_api::{BrowserCookie, Client, ClientConfig, Endpoints, Error, LoginStatus};
 use secrecy::SecretString;
 use serde_json::json;
 
@@ -332,4 +332,54 @@ fn partition_detection_redirects_the_setup_endpoint() {
     let client = Client::new(config).unwrap();
     let _ = client.login(&password());
     assert!(probe.calls() >= 1);
+}
+
+fn browser_cookie(name: &str, value: &str) -> BrowserCookie {
+    BrowserCookie {
+        name: name.into(),
+        value: value.into(),
+        domain: "127.0.0.1".into(),
+        path: "/".into(),
+        secure: false,
+        http_only: true,
+        expires: None,
+    }
+}
+
+#[test]
+fn a_browser_session_is_adopted_without_any_password_exchange() {
+    let server = MockServer::start();
+    let srp = server.mock(|when, then| {
+        when.path_includes("/appleauth/");
+        then.status(500);
+    });
+    let validate = server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/validate").header_includes("cookie", "X-APPLE-WEBAUTH-TOKEN=web-token");
+        then.status(200).header("content-type", "application/json").json_body(account_reply(true));
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let client = client(&server, Some(dir.path()));
+    client
+        .adopt_browser_session(&[
+            browser_cookie("X-APPLE-WEBAUTH-TOKEN", "web-token"),
+            browser_cookie("X-APPLE-WEBAUTH-HSA-TRUST", "trust"),
+        ])
+        .unwrap();
+    validate.assert();
+    assert_eq!(srp.calls(), 0);
+    assert_eq!(client.account_info().apple_id.as_deref(), Some("user@example.com"));
+
+    // It is saved like any other session.
+    assert!(self::client(&server, Some(dir.path())).has_saved_session());
+}
+
+#[test]
+fn a_browser_session_apple_does_not_trust_is_refused() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/validate");
+        then.status(200).header("content-type", "application/json").json_body(account_reply(false));
+    });
+    let err = client(&server, None).adopt_browser_session(&[browser_cookie("X-APPLE-WEBAUTH-TOKEN", "t")]).unwrap_err();
+    assert!(matches!(err, Error::LoginFailed(_)), "{err:?}");
 }

@@ -23,17 +23,11 @@ pub trait Authenticator: Send + 'static {
     fn verify_sms(&mut self, phone: &TrustedPhone, code: &str) -> icloud_api::Result<()>;
     fn verify_trusted_device(&mut self, code: &str) -> icloud_api::Result<()>;
     fn account(&self) -> AccountInfo;
-    /// Use a trust cookie from a signed-in browser in place of a code.
-    fn set_trust_token(&mut self, token: &str);
-    /// Have the person sign in on icloud.com in a browser window and return
-    /// the trust cookie. Blocks until they are done; `opened` is called once
-    /// the window is up. The error is shown to them as it is.
-    fn trust_token_from_browser(&mut self, opened: &mut dyn FnMut()) -> Result<String, String> {
-        let path = crate::browser::require_browser().map_err(|e| e.to_string())?;
-        let window = crate::browser::BrowserSignIn::start(&path).map_err(|e| e.to_string())?;
-        opened();
-        window.wait_for_trust_token(crate::browser::SIGN_IN_TIMEOUT).map_err(|e| e.to_string())
-    }
+    /// Have the person sign in on icloud.com in a browser window and continue
+    /// from that session: no password and no code pass through this program.
+    /// Blocks until they are done; `opened` is called once the window is up.
+    /// The error is shown to them as it is.
+    fn login_in_browser(&mut self, opened: &mut dyn FnMut()) -> Result<(), String>;
 }
 
 impl Authenticator for Client {
@@ -55,8 +49,8 @@ impl Authenticator for Client {
     fn account(&self) -> AccountInfo {
         self.account_info()
     }
-    fn set_trust_token(&mut self, token: &str) {
-        Client::set_trust_token(self, token);
+    fn login_in_browser(&mut self, opened: &mut dyn FnMut()) -> Result<(), String> {
+        crate::browser::sign_in(self, opened).map_err(|err| err.to_string())
     }
 }
 
@@ -71,9 +65,8 @@ pub enum Channel {
 #[derive(Debug)]
 pub enum AuthRequest {
     Login(SecretString),
-    /// Sign in on icloud.com in a browser first, then send the password as
-    /// usual; the browser's trust cookie replaces the verification code.
-    LoginViaBrowser(SecretString),
+    /// Sign in on icloud.com in a browser window. Needs no password.
+    LoginViaBrowser,
     SendSms {
         phone: usize,
     },
@@ -118,28 +111,20 @@ impl AuthWorker {
             .spawn(move || {
                 let mut attempts_left = MAX_CODE_ATTEMPTS;
                 for request in request_rx {
-                    let request = match request {
-                        AuthRequest::LoginViaBrowser(password) => {
-                            let mut gone = false;
-                            let token = auth.trust_token_from_browser(&mut || {
-                                gone = event_tx.send(AuthEvent::BrowserOpened).is_err();
-                            });
-                            if gone {
-                                return;
-                            }
-                            match token {
-                                Ok(token) => auth.set_trust_token(&token),
-                                Err(message) => {
-                                    if event_tx.send(AuthEvent::Failed(message)).is_err() {
-                                        return;
-                                    }
-                                    continue;
-                                }
-                            }
-                            AuthRequest::Login(password)
+                    if matches!(request, AuthRequest::LoginViaBrowser) {
+                        let mut gone = false;
+                        let outcome = auth.login_in_browser(&mut || {
+                            gone = event_tx.send(AuthEvent::BrowserOpened).is_err();
+                        });
+                        let event = match outcome {
+                            Ok(()) => AuthEvent::Authenticated(auth.account()),
+                            Err(message) => AuthEvent::Failed(message),
+                        };
+                        if gone || event_tx.send(event).is_err() {
+                            return;
                         }
-                        other => other,
-                    };
+                        continue;
+                    }
                     let events = handle(&mut *auth, request, &mut attempts_left);
                     for event in events {
                         if event_tx.send(event).is_err() {
@@ -190,9 +175,7 @@ fn describe(err: &ApiError) -> String {
 
 fn handle(auth: &mut dyn Authenticator, request: AuthRequest, attempts_left: &mut u8) -> Vec<AuthEvent> {
     match request {
-        AuthRequest::LoginViaBrowser(_) => {
-            vec![AuthEvent::Failed("Sign-in through the browser was not set up.".into())]
-        }
+        AuthRequest::LoginViaBrowser => Vec::new(), // handled by the worker loop
         AuthRequest::Login(password) => match auth.login(&password) {
             Ok(LoginStatus::Authenticated) => vec![AuthEvent::Authenticated(auth.account())],
             Ok(LoginStatus::TwoFactorRequired) => {
@@ -273,7 +256,7 @@ pub(crate) mod tests {
         pub(crate) login: VecDeque<icloud_api::Result<LoginStatus>>,
         pub(crate) verify: VecDeque<icloud_api::Result<()>>,
         pub(crate) options: TwoFactorOptions,
-        pub(crate) browser: Option<Result<String, String>>,
+        pub(crate) browser: Option<Result<(), String>>,
         pub(crate) log: Arc<Mutex<Vec<String>>>,
     }
 
@@ -330,13 +313,10 @@ pub(crate) mod tests {
         fn account(&self) -> AccountInfo {
             AccountInfo { apple_id: Some("me@example.com".into()), full_name: None }
         }
-        fn set_trust_token(&mut self, token: &str) {
-            self.log.lock().unwrap().push(format!("trust {token}"));
-        }
-        fn trust_token_from_browser(&mut self, opened: &mut dyn FnMut()) -> Result<String, String> {
+        fn login_in_browser(&mut self, opened: &mut dyn FnMut()) -> Result<(), String> {
             self.log.lock().unwrap().push("browser".into());
             opened();
-            self.browser.take().unwrap_or_else(|| Ok("cookie".into()))
+            self.browser.take().unwrap_or(Ok(()))
         }
     }
 
@@ -362,24 +342,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn signing_in_through_the_browser_uses_its_cookie_then_the_password() {
+    fn signing_in_through_the_browser_needs_no_password() {
         let (fake, log) = Fake::new();
         let w = worker(fake);
-        w.request(AuthRequest::LoginViaBrowser(pw()));
+        w.request(AuthRequest::LoginViaBrowser);
         assert_eq!(w.wait(WAIT), Some(AuthEvent::BrowserOpened));
         assert!(matches!(w.wait(WAIT), Some(AuthEvent::Authenticated(_))));
-        assert_eq!(*log.lock().unwrap(), ["browser", "trust cookie", "login"]);
+        assert_eq!(*log.lock().unwrap(), ["browser"], "no password login was attempted");
     }
 
     #[test]
-    fn a_failed_browser_sign_in_never_sends_the_password_to_apple() {
-        let (mut fake, log) = Fake::new();
+    fn a_failed_browser_sign_in_is_reported_as_it_is() {
+        let (mut fake, _) = Fake::new();
         fake.browser = Some(Err("no browser".into()));
         let w = worker(fake);
-        w.request(AuthRequest::LoginViaBrowser(pw()));
+        w.request(AuthRequest::LoginViaBrowser);
         assert_eq!(w.wait(WAIT), Some(AuthEvent::BrowserOpened));
         assert_eq!(w.wait(WAIT), Some(AuthEvent::Failed("no browser".into())));
-        assert_eq!(*log.lock().unwrap(), ["browser"]);
     }
 
     #[test]

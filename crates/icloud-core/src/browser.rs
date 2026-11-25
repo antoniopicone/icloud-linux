@@ -7,8 +7,9 @@
 //! from that profile only and the profile is deleted afterwards. Nothing from
 //! the person's own browser profile is touched.
 //!
-//! The cookie only replaces the verification code. The password is still
-//! needed for the SRP exchange that produces the session token.
+//! The person types their password and code into Apple's own page; this
+//! program never sees them. What it takes is the browser's session cookies,
+//! which Apple then checks (`Client::adopt_browser_session`).
 
 use std::{
     fs,
@@ -18,10 +19,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use icloud_api::{BrowserCookie, Client};
+
 use crate::{Error, Result};
 use serde_json::{Value, json};
 
 const TRUST_COOKIE: &str = "X-APPLE-WEBAUTH-HSA-TRUST";
+const SESSION_COOKIE: &str = "X-APPLE-WEBAUTH-TOKEN";
 const START_URL: &str = "https://www.icloud.com/";
 const BROWSERS: [&str; 7] = [
     "chromium",
@@ -63,11 +67,23 @@ impl BrowserSignIn {
         Ok(Self { _process: process, _profile: profile, ws_url })
     }
 
-    /// Wait for the person to sign in and trust the browser; returns the value
-    /// of the trust cookie.
-    pub fn wait_for_trust_token(&self, timeout: Duration) -> Result<String> {
+    /// Wait for the person to sign in and trust the browser; returns the
+    /// browser's cookies.
+    pub fn wait_for_session(&self, timeout: Duration) -> Result<Vec<BrowserCookie>> {
         wait_for_cookie(&self.ws_url, timeout)
     }
+}
+
+/// Sign in through a browser window and have `client` adopt the session.
+/// `opened` is called once the window is up, before the long wait.
+pub fn sign_in(client: &Client, opened: &mut dyn FnMut()) -> Result<()> {
+    let path = require_browser()?;
+    let window = BrowserSignIn::start(&path)?;
+    opened();
+    let cookies = window.wait_for_session(SIGN_IN_TIMEOUT)?;
+    drop(window); // close the browser before talking to Apple
+    client.adopt_browser_session(&cookies)?;
+    Ok(())
 }
 
 /// [`find_browser`] with the error to show when there is none.
@@ -75,8 +91,7 @@ pub fn require_browser() -> Result<PathBuf> {
     find_browser().ok_or_else(|| {
         Error::Setup(
             "no Chromium-based browser found (chromium, google-chrome, brave-browser, microsoft-edge). \
-             Install one, set ICLOUD_BROWSER to its path, or copy the trust cookie by hand: \
-             `icloudctl auth --trust-token <value>`"
+             Install one, or set ICLOUD_BROWSER to its path"
                 .into(),
         )
     })
@@ -137,7 +152,7 @@ fn parse_active_port(text: &str) -> Option<String> {
     path.starts_with('/').then(|| format!("ws://127.0.0.1:{port}{path}"))
 }
 
-fn wait_for_cookie(ws_url: &str, timeout: Duration) -> Result<String> {
+fn wait_for_cookie(ws_url: &str, timeout: Duration) -> Result<Vec<BrowserCookie>> {
     let deadline = Instant::now() + timeout;
     let (mut socket, _) =
         tungstenite::connect(ws_url).map_err(|err| Error::Setup(format!("could not talk to the browser: {err}")))?;
@@ -152,8 +167,8 @@ fn wait_for_cookie(ws_url: &str, timeout: Duration) -> Result<String> {
             if reply.get("id").and_then(Value::as_u64) != Some(id) {
                 continue; // an event, or the answer to something else
             }
-            if let Some(token) = trust_cookie(&reply) {
-                return Ok(token);
+            if let Some(cookies) = signed_in_cookies(&reply) {
+                return Ok(cookies);
             }
             break;
         }
@@ -165,16 +180,35 @@ fn wait_for_cookie(ws_url: &str, timeout: Duration) -> Result<String> {
     unreachable!("the loop only ends by returning")
 }
 
-/// The trust cookie in a `Storage.getCookies` reply, if Apple has set one.
-fn trust_cookie(reply: &Value) -> Option<String> {
-    reply.get("result")?.get("cookies")?.as_array()?.iter().find_map(|cookie| {
-        let domain = cookie.get("domain")?.as_str()?.trim_start_matches('.');
-        let value = cookie.get("value")?.as_str()?;
-        let ours = cookie.get("name")?.as_str()? == TRUST_COOKIE
-            && (domain.ends_with("icloud.com") || domain.ends_with("apple.com"))
-            && !value.is_empty();
-        ours.then(|| value.to_owned())
-    })
+fn is_apple_domain(domain: &str) -> bool {
+    let host = domain.trim_start_matches('.');
+    ["icloud.com", "apple.com", "icloud-content.com"].iter().any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+/// The Apple cookies in a `Storage.getCookies` reply, once the sign-in is
+/// complete: the session cookie and the trust cookie are both there.
+fn signed_in_cookies(reply: &Value) -> Option<Vec<BrowserCookie>> {
+    let cookies: Vec<BrowserCookie> = reply
+        .get("result")?
+        .get("cookies")?
+        .as_array()?
+        .iter()
+        .filter_map(|c| {
+            let domain = c.get("domain")?.as_str()?;
+            is_apple_domain(domain).then_some(())?;
+            Some(BrowserCookie {
+                name: c.get("name")?.as_str()?.to_owned(),
+                value: c.get("value")?.as_str()?.to_owned(),
+                domain: domain.to_owned(),
+                path: c.get("path").and_then(Value::as_str).unwrap_or("/").to_owned(),
+                secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
+                http_only: c.get("httpOnly").and_then(Value::as_bool).unwrap_or(false),
+                expires: c.get("expires").and_then(Value::as_f64).filter(|e| *e > 0.0),
+            })
+        })
+        .collect();
+    let has = |name: &str| cookies.iter().any(|c| c.name == name && !c.value.is_empty());
+    (has(TRUST_COOKIE) && has(SESSION_COOKIE)).then_some(cookies)
 }
 
 #[cfg(test)]
@@ -194,25 +228,38 @@ mod tests {
         assert!(parse_active_port("45123\nnot-a-path\n").is_none());
     }
 
+    fn cookie(name: &str, domain: &str, value: &str) -> Value {
+        json!({"name": name, "domain": domain, "value": value, "path": "/", "secure": true, "httpOnly": true, "expires": 4_102_444_800.0})
+    }
+
+    fn reply(list: Vec<Value>) -> Value {
+        json!({"id": 1, "result": {"cookies": list}})
+    }
+
     #[test]
-    fn only_the_trust_cookie_on_an_apple_domain_counts() {
-        let cookies = |list: Value| json!({"id": 1, "result": {"cookies": list}});
-        let ok = cookies(json!([
-            {"name": "X-APPLE-WEBAUTH-USER", "domain": ".icloud.com", "value": "u"},
-            {"name": TRUST_COOKIE, "domain": ".icloud.com", "value": "tok"},
-        ]));
-        assert_eq!(trust_cookie(&ok).as_deref(), Some("tok"));
-        assert!(trust_cookie(&cookies(json!([]))).is_none());
-        assert!(
-            trust_cookie(&cookies(json!([{"name": TRUST_COOKIE, "domain": ".icloud.com", "value": ""}]))).is_none()
-        );
-        assert!(
-            trust_cookie(&cookies(json!([{"name": TRUST_COOKIE, "domain": ".evil.example", "value": "x"}]))).is_none()
-        );
-        assert!(
-            trust_cookie(&cookies(json!([{"name": TRUST_COOKIE, "domain": "evilicloud.com.example", "value": "x"}])))
-                .is_none()
-        );
+    fn the_sign_in_is_complete_only_with_both_the_session_and_the_trust_cookie() {
+        let trust = cookie(TRUST_COOKIE, ".icloud.com", "t");
+        let session = cookie(SESSION_COOKIE, ".icloud.com", "s");
+        assert!(signed_in_cookies(&reply(vec![])).is_none());
+        assert!(signed_in_cookies(&reply(vec![trust.clone()])).is_none());
+        assert!(signed_in_cookies(&reply(vec![session.clone()])).is_none());
+        assert!(signed_in_cookies(&reply(vec![cookie(TRUST_COOKIE, ".icloud.com", ""), session.clone()])).is_none());
+        let done = signed_in_cookies(&reply(vec![trust, session, cookie("other", ".apple.com", "o")])).unwrap();
+        assert_eq!(done.len(), 3);
+        assert!(done.iter().all(|c| c.secure && c.http_only && c.expires.is_some()));
+    }
+
+    #[test]
+    fn cookies_of_other_sites_are_never_taken() {
+        let list = vec![
+            cookie(TRUST_COOKIE, ".icloud.com", "t"),
+            cookie(SESSION_COOKIE, ".icloud.com", "s"),
+            cookie("tracker", ".example.com", "x"),
+            cookie("sneaky", "evilicloud.com", "x"),
+            cookie("sneaky2", "icloud.com.example", "x"),
+        ];
+        let done = signed_in_cookies(&reply(list)).unwrap();
+        assert_eq!(done.len(), 2);
     }
 
     #[test]
@@ -228,15 +275,18 @@ mod tests {
                 let cookies = if round == 0 {
                     json!([])
                 } else {
-                    json!([{"name": TRUST_COOKIE, "domain": ".apple.com", "value": "trusted"}])
+                    json!([
+                        cookie(TRUST_COOKIE, ".icloud.com", "trusted"),
+                        cookie(SESSION_COOKIE, ".icloud.com", "session"),
+                    ])
                 };
                 let reply = json!({"id": request["id"], "result": {"cookies": cookies}});
                 ws.send(tungstenite::Message::text(reply.to_string())).unwrap();
             }
         });
-        let token = wait_for_cookie(&format!("ws://127.0.0.1:{port}/devtools/browser/x"), Duration::from_secs(30));
+        let cookies = wait_for_cookie(&format!("ws://127.0.0.1:{port}/devtools/browser/x"), Duration::from_secs(30));
         server.join().unwrap();
-        assert_eq!(token.unwrap(), "trusted");
+        assert!(cookies.unwrap().iter().any(|c| c.value == "trusted"));
     }
 
     #[test]

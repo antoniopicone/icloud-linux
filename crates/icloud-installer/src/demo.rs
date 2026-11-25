@@ -56,12 +56,10 @@ impl Authenticator for DemoAuth {
         }
     }
 
-    fn set_trust_token(&mut self, _: &str) {}
-
-    fn trust_token_from_browser(&mut self, opened: &mut dyn FnMut()) -> Result<String, String> {
+    fn login_in_browser(&mut self, opened: &mut dyn FnMut()) -> Result<(), String> {
         opened();
         thread::sleep(Duration::from_millis(1500));
-        Ok("demo-trust-token".into())
+        Ok(())
     }
 
     fn account(&self) -> AccountInfo {
