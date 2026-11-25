@@ -39,6 +39,15 @@ pub enum Command {
         #[arg(long)]
         notify: bool,
     },
+    /// Offer to sign in again: a notification that runs `auth` when clicked.
+    /// The service starts this when a file cannot be downloaded because the
+    /// session has expired.
+    #[command(hide = true)]
+    SignInOffer {
+        /// The file that could not be opened, named in the notification.
+        #[arg(long)]
+        file: String,
+    },
     /// Start the service.
     Start,
     /// Stop the service and unmount.
@@ -144,6 +153,9 @@ mod tests {
         assert!(matches!(parse(&["init", "/mnt/x"]), Command::Init { mount_dir: Some(_) }));
         assert!(matches!(parse(&["auth"]), Command::Auth { notify: false }));
         assert!(matches!(parse(&["auth", "--notify"]), Command::Auth { notify: true }));
+        assert!(
+            matches!(parse(&["sign-in-offer", "--file", "a b.pdf"]), Command::SignInOffer { file } if file == "a b.pdf")
+        );
         assert!(matches!(
             parse(&["hydrate", "--dry-run", "--verbose"]),
             Command::Hydrate { dry_run: true, verbose: true }

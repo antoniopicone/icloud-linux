@@ -872,8 +872,11 @@ mod tests {
     struct Told(Arc<std::sync::Mutex<Vec<String>>>);
 
     impl crate::notify::Notifier for Told {
-        fn notify(&self, note: &crate::notify::Note) {
-            self.0.lock().unwrap().push(format!("{}: {}", note.title, note.body));
+        fn notify(&self, title: &str, body: &str) {
+            self.0.lock().unwrap().push(format!("{title}: {body}"));
+        }
+        fn offer_sign_in(&self, file_name: &str) {
+            self.0.lock().unwrap().push(format!("offer to sign in: {file_name}"));
         }
     }
 
@@ -892,7 +895,7 @@ mod tests {
         assert_eq!(rig.fs.open_as(&p("/big.bin"), false, &Reader::Person).unwrap_err(), Errno::IO);
         let told = told.0.lock().unwrap();
         assert_eq!(told.len(), 1);
-        assert!(told[0].starts_with("Could not open “big.bin”") && told[0].contains("sign in again"), "{}", told[0]);
+        assert_eq!(told[0], "offer to sign in: big.bin");
     }
 
     #[test]

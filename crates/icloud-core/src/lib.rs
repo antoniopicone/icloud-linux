@@ -13,6 +13,7 @@ pub mod error;
 pub mod fs;
 pub mod hydrate;
 pub mod i18n;
+pub mod icons;
 pub mod installer;
 pub mod mirror;
 pub mod notify;

@@ -10,7 +10,7 @@ use std::{
 use icloud_core::{
     Config, Error, Layout, Result, browser, hydrate,
     i18n::{tr, trf},
-    setup,
+    notify, setup,
     setup::Systemctl,
     sync_request,
 };
@@ -43,6 +43,7 @@ pub fn run(command: Command, ctx: &mut Context<'_>) -> Result<()> {
         Command::Quickstart { mount_dir } => quickstart(ctx, mount_dir),
         Command::Init { mount_dir } => init(ctx, mount_dir),
         Command::Auth { notify } => authenticate(ctx, notify),
+        Command::SignInOffer { file } => sign_in_offer(ctx, &file),
         Command::Start => {
             setup::start(&ctx.layout, ctx.sys)?;
             ctx.ui.say(&setup::status_text(ctx.sys));
@@ -144,6 +145,26 @@ fn authenticate(ctx: &mut Context<'_>, notify_user: bool) -> Result<()> {
         Err(err) => notify(notify_user, tr("iCloud sign-in failed"), &err.to_string()),
     }
     outcome.map(drop)
+}
+
+/// `icloudctl sign-in-offer`: show the offer and, when it is clicked, sign
+/// in. The service runs this as a unit of its own, so the restart at the end
+/// of the sign-in does not stop it.
+fn sign_in_offer(ctx: &mut Context<'_>, file_name: &str) -> Result<()> {
+    let (title, body, button) = notify::sign_in_offer_text(file_name);
+    let desktop = notify::Desktop::session().map_err(|e| Error::Setup(format!("no desktop to notify: {e}")))?;
+    let outcome = desktop
+        .ask(
+            &title,
+            &body,
+            &[(notify::DEFAULT_ACTION, button.as_str()), ("sign-in", button.as_str())],
+            notify::SIGN_IN_OFFER_WAIT,
+        )
+        .map_err(|e| Error::Setup(format!("could not show the notification: {e}")))?;
+    match outcome {
+        notify::Outcome::Clicked(_) => authenticate(ctx, true),
+        notify::Outcome::Closed | notify::Outcome::TimedOut => Ok(()),
+    }
 }
 
 fn sign_in(ctx: &mut Context<'_>) -> Result<Option<String>> {
@@ -271,9 +292,7 @@ fn mounted_dir(ctx: &Context<'_>, config: &Config) -> Result<PathBuf> {
 /// runs without a terminal, so this is the only way it can report anything.
 fn notify(enabled: bool, title: &str, body: &str) {
     if enabled {
-        let _ = Process::new("notify-send")
-            .args(["--app-name=iCloud", "--icon=folder-download-symbolic", "--", title, body])
-            .status();
+        notify::show(title, body);
     }
 }
 

@@ -23,6 +23,8 @@ thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["formatting", "macros"] }
 tracing = "0.1.44"
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+zbus = "5.19.0"
 
 [dev-dependencies]
 icloud-api = { path = "../icloud-api", features = ["testing"] }
+zbus = { version = "5.19.0", features = ["p2p"] }
