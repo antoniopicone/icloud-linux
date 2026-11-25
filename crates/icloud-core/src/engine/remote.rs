@@ -31,16 +31,6 @@ impl Engine {
         let inner = &self.inner;
         let _guard = inner.path_locks.acquire(path);
 
-        if !force && let Some(at) = inner.state.folder_listed_at(path)? {
-            let age = self.now().saturating_sub(at);
-            if age < i64::try_from(inner.config.refresh_interval.as_secs()).unwrap_or(i64::MAX) {
-                return Ok(());
-            }
-        }
-        if !force && let Some(why) = self.recent_listing_failure(path) {
-            return Err(crate::Error::Setup(format!("listing {path} failed a moment ago: {why}")));
-        }
-
         let (folder, drivewsid) = if path.is_root() {
             (Node::root(), None)
         } else {
@@ -61,6 +51,18 @@ impl Engine {
             let id = node.drivewsid.clone();
             (node, Some(id))
         };
+
+        // A listing counts only for the folder it was made of: the same path
+        // may have shown another folder before (see `unique_local_names`).
+        if !force && let Some(at) = inner.state.folder_listed_at_as(path, drivewsid.as_deref())? {
+            let age = self.now().saturating_sub(at);
+            if age < i64::try_from(inner.config.refresh_interval.as_secs()).unwrap_or(i64::MAX) {
+                return Ok(());
+            }
+        }
+        if !force && let Some(why) = self.recent_listing_failure(path) {
+            return Err(crate::Error::Setup(format!("listing {path} failed a moment ago: {why}")));
+        }
 
         sync_event!(info, "list-directory-start", path = path);
         let started = Instant::now();
@@ -87,8 +89,8 @@ impl Engine {
         }
 
         let mut seen: HashSet<&str> = HashSet::new();
-        for child in &children {
-            let Some(child_path) = path.join(&child.name) else {
+        for (child, name) in children.iter().zip(unique_local_names(path, &children)) {
+            let Some(child_path) = path.join(&name) else {
                 tracing::warn!("ignoring {:?} in {path}: not a usable file name", child.name);
                 continue;
             };
@@ -316,8 +318,9 @@ impl Engine {
             };
             snapshot.visited.insert(path.clone());
 
-            for child in children {
-                let Some(child_path) = path.join(&child.name) else {
+            let names = unique_local_names(&path, &children);
+            for (child, name) in children.into_iter().zip(names) {
+                let Some(child_path) = path.join(&name) else {
                     tracing::warn!("ignoring {:?} in {path}: not a usable file name", child.name);
                     continue;
                 };
@@ -448,6 +451,65 @@ impl Engine {
             self.schedule_download(path);
         }
         Ok(())
+    }
+}
+
+/// The local name of each of a folder's children, unique within the folder.
+///
+/// iCloud Drive may list two items with the same name side by side: an app's
+/// library is named after the app's own folder, so Scanner Pro's "Documents"
+/// sits next to the user's "Documents". On disk only one can have the name.
+/// The ordinary item keeps it, then the one with the smallest id, so every
+/// listing gives the same answer; the others are told apart by their app
+/// ("Documents (com.readdle.Scanner.PDF)") or by a number ("scan (2).pdf").
+/// The names on iCloud do not change.
+fn unique_local_names(folder: &IcPath, children: &[Node]) -> Vec<String> {
+    let mut order: Vec<usize> = (0..children.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&children[a], &children[b]);
+        (a.kind == NodeKind::AppLibrary, &a.drivewsid).cmp(&(b.kind == NodeKind::AppLibrary, &b.drivewsid))
+    });
+
+    let mut names: Vec<Option<String>> = vec![None; children.len()];
+    let mut taken: HashSet<String> = HashSet::new();
+    for &i in &order {
+        if taken.insert(children[i].name.clone()) {
+            names[i] = Some(children[i].name.clone());
+        }
+    }
+    for &i in &order {
+        if names[i].is_some() {
+            continue;
+        }
+        let child = &children[i];
+        let candidates = (1..).map(|n| alternative_name(child, n));
+        let name = candidates
+            .take(1000)
+            .find(|candidate| !taken.contains(candidate))
+            .unwrap_or_else(|| child.drivewsid.clone());
+        tracing::info!(
+            "{folder} holds more than one item named {:?}; showing {} as {name:?}",
+            child.name,
+            child.drivewsid
+        );
+        taken.insert(name.clone());
+        names[i] = Some(name);
+    }
+    names.into_iter().map(Option::unwrap_or_default).collect()
+}
+
+/// The `n`th name to try for an item whose own name is taken.
+fn alternative_name(child: &Node, n: u32) -> String {
+    let counter = if n == 1 { String::new() } else { format!(" {n}") };
+    if child.kind == NodeKind::AppLibrary
+        && let Some(app) = child.zone.as_deref().map(|zone| zone.strip_prefix("iCloud.").unwrap_or(zone))
+    {
+        return format!("{} ({app}{counter})", child.name);
+    }
+    let n = n + 1; // "scan.pdf", then "scan (2).pdf"
+    match child.name.rsplit_once('.') {
+        Some((stem, ext)) if child.kind == NodeKind::File && !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{} ({n})", child.name),
     }
 }
 
@@ -667,6 +729,105 @@ mod tests {
         assert!(moved.hydrated, "a rename must not throw the cached content away");
         assert_eq!(rig.local("/renamed.txt"), b"top");
         assert!(!rig.engine.inner.mirror.exists(&Rig::path("/top.txt")));
+    }
+
+    // ---- items with the same name ------------------------------------------------
+
+    fn node(id: &str, name: &str, kind: NodeKind, zone: &str) -> Node {
+        Node {
+            drivewsid: id.into(),
+            docwsid: None,
+            etag: None,
+            zone: Some(zone.into()),
+            share_id: None,
+            name: name.into(),
+            kind,
+            size: 0,
+            modified: 0,
+        }
+    }
+
+    const SCANNER: &str = "iCloud.com.readdle.Scanner.PDF";
+    const SCANNER_DOCUMENTS: &str = "/Documents (com.readdle.Scanner.PDF)";
+
+    #[test]
+    fn same_named_items_get_distinct_local_names_whatever_the_order() {
+        let folder = node("FOLDER::com.apple.CloudDocs::C3", "Documents", NodeKind::Folder, "com.apple.CloudDocs");
+        let library =
+            node("FOLDER::iCloud.com.readdle.Scanner.PDF::documents", "Documents", NodeKind::AppLibrary, SCANNER);
+        let other = node("FILE::com.apple.CloudDocs::1", "notes.txt", NodeKind::File, "com.apple.CloudDocs");
+        let root = IcPath::root();
+        assert_eq!(
+            unique_local_names(&root, &[folder.clone(), library.clone(), other.clone()]),
+            ["Documents", "Documents (com.readdle.Scanner.PDF)", "notes.txt"]
+        );
+        assert_eq!(
+            unique_local_names(&root, &[other, library, folder]),
+            ["notes.txt", "Documents (com.readdle.Scanner.PDF)", "Documents"],
+            "the ordinary folder keeps the name in any order"
+        );
+    }
+
+    #[test]
+    fn same_named_files_are_numbered_without_taking_a_name_in_use() {
+        let a = node("FILE::z::1", "scan.pdf", NodeKind::File, "z");
+        let b = node("FILE::z::2", "scan.pdf", NodeKind::File, "z");
+        let in_use = node("FILE::z::3", "scan (2).pdf", NodeKind::File, "z");
+        assert_eq!(unique_local_names(&IcPath::root(), &[b, in_use, a]), ["scan (3).pdf", "scan (2).pdf", "scan.pdf"]);
+    }
+
+    #[test]
+    fn a_folder_and_an_app_library_of_the_same_name_each_show_their_own_contents() {
+        let rig = Rig::new();
+        let documents = rig.drive.add_folder("/", "Documents");
+        rig.drive.add_folder("/Documents", "Taxes");
+        let library = rig.drive.add_app_library("/", "Documents", SCANNER);
+        rig.drive.add_file_to(&library, "scan.pdf", b"pdf", 10);
+
+        for _ in 0..2 {
+            // The second time round nothing may swap.
+            rig.engine.list_directory(&IcPath::root(), true).unwrap();
+            assert_eq!(child_names(&rig.engine, "/"), ["Documents", &SCANNER_DOCUMENTS[1..]]);
+            rig.engine.list_directory(&Rig::path("/Documents"), false).unwrap();
+            rig.engine.list_directory(&Rig::path(SCANNER_DOCUMENTS), false).unwrap();
+            assert_eq!(child_names(&rig.engine, "/Documents"), ["Taxes"]);
+            assert_eq!(child_names(&rig.engine, SCANNER_DOCUMENTS), ["scan.pdf"]);
+            assert_eq!(rig.entry("/Documents").unwrap().remote_drivewsid, Some(documents.drivewsid.clone()));
+        }
+    }
+
+    #[test]
+    fn a_folder_path_left_showing_an_app_library_is_put_right() {
+        // What earlier versions left behind: "/Documents" listed as Scanner Pro's library.
+        let rig = Rig::new();
+        rig.drive.add_folder("/", "Documents");
+        rig.drive.add_folder("/Documents", "Taxes");
+        let library = rig.drive.add_app_library("/", "Documents", SCANNER);
+        rig.drive.add_file_to(&library, "scan.pdf", b"pdf", 10);
+        let documents = Rig::path("/Documents");
+        rig.engine.inner.mirror.ensure_dir(&documents).unwrap();
+        rig.engine.inner.state.upsert_entry(&Entry::from_remote(documents.clone(), &library)).unwrap();
+        rig.engine.list_directory(&documents, false).unwrap();
+        assert_eq!(child_names(&rig.engine, "/Documents"), ["scan.pdf"]);
+
+        rig.engine.list_directory(&IcPath::root(), false).unwrap();
+        // Not forced: the earlier listing of "/Documents" was of the library, so it does not count.
+        rig.engine.list_directory(&documents, false).unwrap();
+        rig.engine.list_directory(&Rig::path(SCANNER_DOCUMENTS), false).unwrap();
+        assert_eq!(child_names(&rig.engine, "/Documents"), ["Taxes"]);
+        assert_eq!(child_names(&rig.engine, SCANNER_DOCUMENTS), ["scan.pdf"]);
+    }
+
+    #[test]
+    fn a_full_crawl_gives_same_named_items_the_same_local_names() {
+        let rig = Rig::full();
+        rig.drive.add_folder("/", "Documents");
+        rig.drive.add_folder("/Documents", "Taxes");
+        let library = rig.drive.add_app_library("/", "Documents", SCANNER);
+        rig.drive.add_file_to(&library, "scan.pdf", b"pdf", 10);
+        rig.engine.initial_scan().unwrap();
+        assert_eq!(child_names(&rig.engine, "/Documents"), ["Taxes"]);
+        assert_eq!(child_names(&rig.engine, SCANNER_DOCUMENTS), ["scan.pdf"]);
     }
 
     #[test]

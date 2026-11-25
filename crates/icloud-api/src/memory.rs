@@ -27,6 +27,8 @@ struct Item {
     data: Vec<u8>,
     etag: u64,
     modified: i64,
+    /// The item's zone when it is not iCloud Drive's own (an app library).
+    zone: Option<String>,
 }
 
 /// What to make every call do instead of working.
@@ -70,8 +72,15 @@ impl Default for MemoryDrive {
 
 impl MemoryDrive {
     pub fn new() -> Self {
-        let root =
-            Item { parent: None, name: "root".into(), kind: NodeKind::Folder, data: vec![], etag: 1, modified: 0 };
+        let root = Item {
+            parent: None,
+            name: "root".into(),
+            kind: NodeKind::Folder,
+            data: vec![],
+            etag: 1,
+            modified: 0,
+            zone: None,
+        };
         let items = BTreeMap::from([(ROOT_DRIVEWSID.to_owned(), root)]);
         Self {
             inner: Mutex::new(Inner {
@@ -105,6 +114,33 @@ impl MemoryDrive {
         let mut inner = self.inner();
         let parent = inner.resolve(parent_path).unwrap_or_else(|| panic!("no such folder {parent_path}"));
         inner.create(&parent, name, kind, data, modified)
+    }
+
+    /// Create an app's library (the folder an app keeps in iCloud Drive) in
+    /// `zone`, called `name`. Unlike [`add_folder`](Self::add_folder) the name
+    /// is not made unique: Apple lists an app library next to an ordinary
+    /// folder of the same name (Scanner Pro's "Documents").
+    pub fn add_app_library(&self, parent_path: &str, name: &str, zone: &str) -> Node {
+        let mut inner = self.inner();
+        let parent = inner.resolve(parent_path).unwrap_or_else(|| panic!("no such folder {parent_path}"));
+        let id = format!("FOLDER::{zone}::documents");
+        let item = Item {
+            parent: Some(parent),
+            name: name.to_owned(),
+            kind: NodeKind::AppLibrary,
+            data: vec![],
+            etag: 1,
+            modified: 0,
+            zone: Some(zone.to_owned()),
+        };
+        inner.items.insert(id.clone(), item);
+        inner.node(&id)
+    }
+
+    /// Create a file inside the folder `parent`, for folders a path cannot
+    /// name unambiguously.
+    pub fn add_file_to(&self, parent: &Node, name: &str, contents: &[u8], modified: i64) -> Node {
+        self.inner().create(&parent.drivewsid, name, NodeKind::File, contents.to_vec(), modified)
     }
 
     /// Replace a file's contents as if edited on another device.
@@ -223,7 +259,7 @@ impl Inner {
             drivewsid: id.to_owned(),
             docwsid: id.rsplit("::").next().map(str::to_owned),
             etag: Some(format!("e{}", item.etag)),
-            zone: Some(CLOUD_DOCS_ZONE.to_owned()),
+            zone: Some(item.zone.clone().unwrap_or_else(|| CLOUD_DOCS_ZONE.to_owned())),
             share_id: None,
             name: item.name.clone(),
             kind: item.kind,
@@ -247,8 +283,10 @@ impl Inner {
         self.next_id += 1;
         let label = if kind == NodeKind::File { "FILE" } else { "FOLDER" };
         let id = format!("{label}::{CLOUD_DOCS_ZONE}::{}", self.next_id);
-        self.items
-            .insert(id.clone(), Item { parent: Some(parent.to_owned()), name: unique, kind, data, etag: 1, modified });
+        self.items.insert(
+            id.clone(),
+            Item { parent: Some(parent.to_owned()), name: unique, kind, data, etag: 1, modified, zone: None },
+        );
         self.node(&id)
     }
 

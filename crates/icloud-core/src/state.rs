@@ -655,6 +655,19 @@ impl SyncState {
             .optional()?)
     }
 
+    /// When `path` was last listed as the folder `drivewsid`. A listing of
+    /// another folder that had the same path once does not count.
+    pub fn folder_listed_at_as(&self, path: &IcPath, drivewsid: Option<&str>) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT listed_at FROM folder_listings WHERE path = ?1 AND remote_drivewsid IS ?2",
+                params![path.as_str(), drivewsid],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn mark_folder_listed(&self, path: &IcPath, drivewsid: Option<&str>) -> Result<()> {
         self.mark_folder_listed_at(path, drivewsid, now())
     }
