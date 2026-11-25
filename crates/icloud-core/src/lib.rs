@@ -12,6 +12,7 @@ pub mod engine;
 pub mod error;
 pub mod fs;
 pub mod hydrate;
+pub mod i18n;
 pub mod installer;
 pub mod mirror;
 pub mod path;

@@ -23,7 +23,11 @@ use std::{
 use icloud_api::{AccountInfo, BrowserCookie, Client, ClientConfig};
 use serde_json::{Value, json};
 
-use crate::{Config, Error, Layout, Result, connect, setup};
+use crate::{
+    Config, Error, Layout, Result, connect,
+    i18n::{tr, trf},
+    setup,
+};
 
 const TRUST_COOKIE: &str = "X-APPLE-WEBAUTH-HSA-TRUST";
 const SESSION_COOKIE: &str = "X-APPLE-WEBAUTH-TOKEN";
@@ -116,13 +120,21 @@ pub fn sign_in_and_save(layout: &Layout, opened: &mut dyn FnMut()) -> Result<Acc
     let mut client_config = ClientConfig::new("browser-sign-in", None);
     client_config.endpoints = connect::endpoints();
     let client = Client::new(client_config)?;
-    client.adopt_browser_session(&cookies)?;
+    client.adopt_browser_session(&cookies).map_err(|err| match err {
+        icloud_api::Error::LoginFailed(detail) => {
+            tracing::info!("{detail}");
+            Error::Setup(
+                tr("Apple did not accept the session from the browser. Try again, and choose Trust when Apple asks.")
+                    .into(),
+            )
+        }
+        other => other.into(),
+    })?;
     let info = client.account_info();
-    let apple_id = info
-        .apple_id
-        .clone()
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| Error::Setup("Apple accepted the sign-in but did not say which Apple ID it is".into()))?;
+    let apple_id =
+        info.apple_id.clone().filter(|id| !id.trim().is_empty()).ok_or_else(|| {
+            Error::Setup(tr("Apple accepted the sign-in but did not say which Apple ID it is").into())
+        })?;
     client.session().save_as(&apple_id, &config.cookie_dir)?;
     setup::configure(layout, &apple_id, None)?;
     Ok(info)
@@ -132,9 +144,9 @@ pub fn sign_in_and_save(layout: &Layout, opened: &mut dyn FnMut()) -> Result<Acc
 pub fn require_browser() -> Result<PathBuf> {
     find_browser().ok_or_else(|| {
         Error::Setup(
-            "No Chromium-based browser was found (Chromium, Chrome, Brave, Edge, Vivaldi). \
-             Install one, or set ICLOUD_BROWSER to its path."
-                .into(),
+            tr("No Chromium-based browser was found (Chromium, Chrome, Brave, Edge, Vivaldi). \
+                Install one, or set ICLOUD_BROWSER to its path.")
+            .into(),
         )
     })
 }
@@ -168,7 +180,7 @@ fn spawn(browser: &Path, profile: &Path) -> Result<Child> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|err| Error::Setup(format!("could not start {}: {err}", browser.display())))
+        .map_err(|err| Error::Setup(trf("could not start {}: {}", &[&browser.display(), &err])))
 }
 
 /// `$ICLOUD_BROWSER_ARGS`: extra flags for the browser, separated by spaces.
@@ -187,10 +199,10 @@ fn debugging_endpoint(profile: &Path, child: &mut Child) -> Result<String> {
             return Ok(url);
         }
         if child.try_wait()?.is_some() {
-            return Err(Error::Setup("the browser exited before it was ready".into()));
+            return Err(Error::Setup(tr("the browser exited before it was ready").into()));
         }
         if Instant::now() >= deadline {
-            return Err(Error::Setup("the browser did not open its debugging port in time".into()));
+            return Err(Error::Setup(tr("the browser did not open its debugging port in time").into()));
         }
         thread::sleep(Duration::from_millis(200));
     }
@@ -206,8 +218,8 @@ fn parse_active_port(text: &str) -> Option<String> {
 fn wait_for_cookie(ws_url: &str, timeout: Duration) -> Result<Vec<BrowserCookie>> {
     let deadline = Instant::now() + timeout;
     let (mut socket, _) =
-        tungstenite::connect(ws_url).map_err(|err| Error::Setup(format!("could not talk to the browser: {err}")))?;
-    let closed = || Error::Setup("the browser was closed before the sign-in finished".into());
+        tungstenite::connect(ws_url).map_err(|err| Error::Setup(trf("could not talk to the browser: {}", &[&err])))?;
+    let closed = || Error::Setup(tr("the browser was closed before the sign-in finished").into());
     for id in 1_u64.. {
         let request = json!({"id": id, "method": "Storage.getCookies"});
         socket.send(tungstenite::Message::text(request.to_string())).map_err(|_| closed())?;
@@ -224,7 +236,7 @@ fn wait_for_cookie(ws_url: &str, timeout: Duration) -> Result<Vec<BrowserCookie>
             break;
         }
         if Instant::now() >= deadline {
-            return Err(Error::Setup("timed out waiting for the sign-in in the browser".into()));
+            return Err(Error::Setup(tr("timed out waiting for the sign-in in the browser").into()));
         }
         thread::sleep(POLL_EVERY);
     }

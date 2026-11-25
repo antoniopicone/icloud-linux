@@ -14,7 +14,12 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk4::{gio, glib};
-use icloud_core::{Layout, installer::Backend, setup::RealSystemctl};
+use icloud_core::{
+    Layout,
+    i18n::{tr, trf},
+    installer::Backend,
+    setup::RealSystemctl,
+};
 use libadwaita as adw;
 
 const APP_ID: &str = "org.icloud_linux.Installer";
@@ -33,12 +38,15 @@ fn main() -> glib::ExitCode {
             "--page" => start_page = args.next(),
             "-h" | "--help" => {
                 println!(
-                    "usage: icloud-installer [--demo]\n\n  --demo  try the wizard without an Apple account or any change to this machine"
+                    "{}",
+                    tr(
+                        "usage: icloud-installer [--demo]\n\n  --demo  try the wizard without an Apple account or any change to this machine"
+                    )
                 );
                 return glib::ExitCode::SUCCESS;
             }
             other => {
-                eprintln!("unknown argument `{other}`; see --help");
+                eprintln!("{}", trf("unknown argument `{}`; see --help", &[&other]));
                 return glib::ExitCode::FAILURE;
             }
         }

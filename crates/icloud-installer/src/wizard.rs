@@ -23,6 +23,7 @@ use icloud_api::AccountInfo;
 use icloud_core::{
     Layout,
     config::CrawlMode,
+    i18n::{tr, trf},
     installer::{Backend, InstallPlan, Prepared, StepOutcome, validate_mount_dir},
     setup::Severity,
 };
@@ -35,8 +36,6 @@ thread_local! {
     static ALIVE: RefCell<Option<Rc<Wizard>>> = const { RefCell::new(None) };
 }
 
-const TITLE: &str = "iCloud for Linux";
-
 const STEPS: [(&str, &str); 5] = [
     ("welcome", "Requirements"),
     ("folder", "Folder"),
@@ -44,6 +43,11 @@ const STEPS: [(&str, &str); 5] = [
     ("install", "Setting up"),
     ("done", "Done"),
 ];
+
+/// The window title.
+fn app_title() -> &'static str {
+    tr("iCloud for Linux")
+}
 
 /// Run `work` on a thread and hand its result to `done` on the main loop.
 fn background<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static, done: impl FnOnce(T) + 'static) {
@@ -229,7 +233,7 @@ pub(crate) fn present(
 ) {
     let stack =
         gtk::Stack::builder().transition_type(gtk::StackTransitionType::SlideLeft).transition_duration(180).build();
-    let title = adw::WindowTitle::new(if demo { "iCloud for Linux — demo" } else { TITLE }, "");
+    let title = adw::WindowTitle::new(if demo { tr("iCloud for Linux — demo") } else { app_title() }, "");
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&title));
 
@@ -242,7 +246,7 @@ pub(crate) fn present(
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title(TITLE)
+        .title(app_title())
         .default_width(640)
         .default_height(640)
         .content(&root)
@@ -284,46 +288,47 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     welcome_content.append(&checks);
     if demo {
         welcome_content.append(&label(
-            "Demo mode: nothing on this computer is changed, and no browser opens: the sign-in is pretended.",
+            tr("Demo mode: nothing on this computer is changed, and no browser opens: the sign-in is pretended."),
             &["caption", "dim-label"],
         ));
     }
     let welcome = adw::StatusPage::builder()
         .icon_name("weather-overcast-symbolic")
-        .title("Welcome to iCloud for Linux")
-        .description(
+        .title(tr("Welcome to iCloud for Linux"))
+        .description(tr(
             "This sets up iCloud Drive as a normal folder on this computer. Files download when you open them, \
              and changes you make are uploaded for you.",
-        )
+        ))
         .child(&narrow(&welcome_content))
         .build();
-    let welcome_quit = gtk::Button::with_label("Quit");
-    let recheck = gtk::Button::with_label("Check Again");
-    let welcome_next = primary("Continue");
+    let welcome_quit = gtk::Button::with_label(tr("Quit"));
+    let recheck = gtk::Button::with_label(tr("Check Again"));
+    let welcome_next = primary(tr("Continue"));
     stack.add_named(&page(&welcome, &[&welcome_quit, &recheck, &welcome_next]), Some("welcome"));
 
     // folder
     let (folder_scroll, folder) =
-        form("Where should iCloud Drive appear?", "Pick an empty folder. It will show your iCloud files.");
+        form(tr("Where should iCloud Drive appear?"), tr("Pick an empty folder. It will show your iCloud files."));
     let location = adw::PreferencesGroup::new();
-    let folder_entry = adw::EntryRow::builder().title("Folder").text(plan.mount_dir.to_string_lossy().as_ref()).build();
+    let folder_entry =
+        adw::EntryRow::builder().title(tr("Folder")).text(plan.mount_dir.to_string_lossy().as_ref()).build();
     let browse = gtk::Button::from_icon_name("folder-open-symbolic");
-    browse.set_tooltip_text(Some("Choose a folder"));
+    browse.set_tooltip_text(Some(tr("Choose a folder")));
     browse.set_valign(gtk::Align::Center);
     browse.add_css_class("flat");
     folder_entry.add_suffix(&browse);
     location.add(&folder_entry);
     folder.append(&location);
 
-    let mode = adw::PreferencesGroup::builder().title("How should it work?").build();
+    let mode = adw::PreferencesGroup::builder().title(tr("How should it work?")).build();
     let lazy = gtk::CheckButton::new();
     let full = gtk::CheckButton::new();
     full.set_group(Some(&lazy));
     lazy.set_active(plan.crawl_mode == CrawlMode::Lazy);
     full.set_active(plan.crawl_mode == CrawlMode::Full);
     for (check, title, subtitle) in [
-        (&lazy, "Open folders on demand", "Recommended. Fast to start, uses little disk."),
-        (&full, "Index everything up front", "Slower to start; lets you search the whole drive."),
+        (&lazy, tr("Open folders on demand"), tr("Recommended. Fast to start, uses little disk.")),
+        (&full, tr("Index everything up front"), tr("Slower to start; lets you search the whole drive.")),
     ] {
         let option = row(title, subtitle);
         check.set_valign(gtk::Align::Center);
@@ -333,7 +338,7 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     }
     folder.append(&mode);
 
-    let extras = adw::PreferencesGroup::builder().title("Extras").build();
+    let extras = adw::PreferencesGroup::builder().title(tr("Extras")).build();
     let switch = |active: bool| gtk::Switch::builder().active(active).valign(gtk::Align::Center).build();
     let indexer = switch(plan.keep_indexer_out);
     let sidebar = switch(plan.show_sidebar_status);
@@ -341,11 +346,15 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     for (toggle, title, subtitle) in [
         (
             &indexer,
-            "Keep the search indexer out",
-            "Stops desktop search from downloading the whole drive. Recommended.",
+            tr("Keep the search indexer out"),
+            tr("Stops desktop search from downloading the whole drive. Recommended."),
         ),
-        (&sidebar, "Show activity in the Files sidebar", "What iCloud is doing appears next to its name."),
-        (&menu, "Add “Download from iCloud” to Files", "In the right-click menu, to keep files on this computer."),
+        (&sidebar, tr("Show activity in the Files sidebar"), tr("What iCloud is doing appears next to its name.")),
+        (
+            &menu,
+            tr("Add “Download from iCloud” to Files"),
+            tr("In the right-click menu, to keep files on this computer."),
+        ),
     ] {
         let option = row(title, subtitle);
         option.add_suffix(toggle);
@@ -357,13 +366,13 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     folder.append(&folder_message);
     let folder_busy = Busy::new();
     folder.append(&folder_busy.row);
-    let folder_back = gtk::Button::with_label("Back");
-    let folder_next = primary("Continue");
+    let folder_back = gtk::Button::with_label(tr("Back"));
+    let folder_next = primary(tr("Continue"));
     stack.add_named(&page(&folder_scroll, &[&folder_back, &folder_next]), Some("folder"));
 
     // account
     let account_content = gtk::Box::new(gtk::Orientation::Vertical, 18);
-    let sign_in = primary("Sign In on icloud.com");
+    let sign_in = primary(tr("Sign In on icloud.com"));
     sign_in.add_css_class("pill");
     sign_in.set_halign(gtk::Align::Center);
     account_content.append(&sign_in);
@@ -375,8 +384,8 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     account_message.set_xalign(0.5);
     account_content.append(&account_message);
     let account_note = label(
-        "When Apple asks whether to trust the browser, choose Trust: that keeps you signed in here. \
-         No password is stored; when the session expires, you sign in the same way again.",
+        tr("When Apple asks whether to trust the browser, choose Trust: that keeps you signed in here. \
+         No password is stored; when the session expires, you sign in the same way again."),
         &["caption", "dim-label"],
     );
     account_note.set_justify(gtk::Justification::Center);
@@ -384,30 +393,30 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     account_content.append(&account_note);
     let account = adw::StatusPage::builder()
         .icon_name("web-browser-symbolic")
-        .title("Sign in to iCloud")
-        .description(
+        .title(tr("Sign in to iCloud"))
+        .description(tr(
             "You sign in on Apple's own page, in a browser window that opens for this. Your Apple ID, password \
              and verification code are typed there and never reach this app.",
-        )
+        ))
         .child(&narrow(&account_content))
         .build();
-    let account_back = gtk::Button::with_label("Back");
+    let account_back = gtk::Button::with_label(tr("Back"));
     stack.add_named(&page(&account, &[&account_back]), Some("account"));
 
     // install
-    let (install_scroll, install) = form("Setting things up", "");
+    let (install_scroll, install) = form(tr("Setting things up"), "");
     let steps = boxed_list();
     install.append(&steps);
     let install_busy = Busy::new();
     install.append(&install_busy.row);
-    let install_next = primary("Continue");
+    let install_next = primary(tr("Continue"));
     install_next.set_sensitive(false);
     stack.add_named(&page(&install_scroll, &[&install_next]), Some("install"));
 
     // done
     let done = adw::StatusPage::builder().icon_name("emblem-ok-symbolic").build();
-    let open_folder = primary("Open iCloud Drive");
-    let close = gtk::Button::with_label("Close");
+    let open_folder = primary(tr("Open iCloud Drive"));
+    let close = gtk::Button::with_label(tr("Close"));
     stack.add_named(&page(&done, &[&close, &open_folder]), Some("done"));
 
     // The wiring finds buttons by these names.
@@ -474,7 +483,7 @@ fn find_button(root: &gtk::Stack, name: &str) -> Option<gtk::Button> {
 impl Wizard {
     fn go(self: &Rc<Self>, page: &str) {
         let index = STEPS.iter().position(|(name, _)| *name == page).unwrap_or(0);
-        self.title.set_subtitle(&format!("Step {} of {} · {}", index + 1, STEPS.len(), STEPS[index].1));
+        self.title.set_subtitle(&trf("Step {} of {} · {}", &[&(index + 1), &STEPS.len(), &tr(STEPS[index].1)]));
         self.stack.set_visible_child_name(page);
         if page == "install" {
             self.begin_install();
@@ -486,9 +495,9 @@ impl Wizard {
     fn prime_demo_page(self: &Rc<Self>, page: Option<&str>) {
         if page == Some("done") {
             let outcomes: Vec<StepOutcome> =
-                ["Start the iCloud service", "Mount iCloud Drive", "Keep the search indexer out"]
+                [tr("Start the iCloud service"), tr("Mount iCloud Drive"), tr("Keep the search indexer out")]
                     .iter()
-                    .map(|title| StepOutcome { title: (*title).to_owned(), result: Ok("done".into()) })
+                    .map(|title| StepOutcome { title: (*title).to_owned(), result: Ok(tr("done").into()) })
                     .collect();
             self.finish_page(&outcomes);
         }
@@ -551,7 +560,7 @@ impl Wizard {
         }
         Self::show_note(&w.folder_message, "");
         w.folder_next.set_sensitive(false);
-        w.folder_busy.show("Preparing the service…");
+        w.folder_busy.show(tr("Preparing the service…"));
 
         let (backend, plan) = (Arc::clone(&self.backend), self.plan.borrow().clone());
         let weak = Rc::downgrade(self);
@@ -567,9 +576,9 @@ impl Wizard {
                         if prepared.used_fallback {
                             Self::show_note(
                                 &w.folder_message,
-                                &format!(
+                                &trf(
                                     "That folder could not be used; {} will be used instead.",
-                                    prepared.mount_dir.display()
+                                    &[&prepared.mount_dir.display()],
                                 ),
                             );
                         }
@@ -588,7 +597,7 @@ impl Wizard {
         let w = &self.widgets;
         Self::show_note(&w.account_message, "");
         w.sign_in.set_sensitive(false);
-        w.account_busy.show("Waiting for you to sign in in the browser window…");
+        w.account_busy.show(tr("Waiting for you to sign in in the browser window…"));
 
         let backend = Arc::clone(&self.backend);
         let weak = Rc::downgrade(self);
@@ -622,11 +631,15 @@ impl Wizard {
         let w = &self.widgets;
         clear(&w.steps);
         let mount = self.plan.borrow().mount_dir.display().to_string();
-        self.add_step("Prepare the folder and the service", &Ok(mount));
-        let who =
-            self.account.borrow().as_ref().and_then(|a| a.apple_id.clone()).unwrap_or_else(|| "your account".into());
-        self.add_step("Sign in to iCloud", &Ok(format!("{who}, no password stored")));
-        w.install_busy.show("Starting iCloud Drive…");
+        self.add_step(tr("Prepare the folder and the service"), &Ok(mount));
+        let who = self
+            .account
+            .borrow()
+            .as_ref()
+            .and_then(|a| a.apple_id.clone())
+            .unwrap_or_else(|| tr("your account").into());
+        self.add_step(tr("Sign in to iCloud"), &Ok(trf("{}, no password stored", &[&who])));
+        w.install_busy.show(tr("Starting iCloud Drive…"));
         w.install_next.set_sensitive(false);
 
         let (backend, plan) = (Arc::clone(&self.backend), self.plan.borrow().clone());
@@ -651,30 +664,33 @@ impl Wizard {
         let mount = self.plan.borrow().mount_dir.display().to_string();
         if outcomes.iter().all(StepOutcome::is_ok) {
             w.done.set_icon_name(Some("emblem-ok-symbolic"));
-            w.done.set_title("iCloud Drive Is Ready");
-            let mut body = format!(
-                "Your files are in {mount}. Folders load as you open them; a file downloads when you open it or \
+            w.done.set_title(tr("iCloud Drive Is Ready"));
+            let mut body = trf(
+                "Your files are in {}. Folders load as you open them; a file downloads when you open it or \
                  choose “Download from iCloud” in its right-click menu. Changes you make there are uploaded \
-                 automatically."
+                 automatically.",
+                &[&mount],
             );
             if self.plan.borrow().show_sidebar_status {
-                body.push_str("\n\nThe Files sidebar shows what iCloud is doing next to its name.");
+                body.push_str("\n\n");
+                body.push_str(tr("The Files sidebar shows what iCloud is doing next to its name."));
             }
             if self.plan.borrow().add_context_menu {
-                body.push_str(
-                    "\n\nRight-click a file or folder in iCloud Drive, then Scripts, to keep it on this computer.",
-                );
+                body.push_str("\n\n");
+                body.push_str(tr(
+                    "Right-click a file or folder in iCloud Drive, then Scripts, to keep it on this computer.",
+                ));
             }
             // The description is markup; the folder name must not be read as such.
             w.done.set_description(Some(&glib::markup_escape_text(&body)));
             w.open_folder.set_sensitive(true);
         } else {
             w.done.set_icon_name(Some("dialog-warning-symbolic"));
-            w.done.set_title("Almost There");
-            w.done.set_description(Some(
+            w.done.set_title(tr("Almost There"));
+            w.done.set_description(Some(tr(
                 "Something did not finish. Run <tt>icloudctl doctor</tt> to see what is wrong and how to fix it, \
                  or <tt>icloudctl logs</tt> for details. Your sign-in was saved, so you will not have to repeat it.",
-            ));
+            )));
             w.open_folder.set_sensitive(false);
         }
     }
@@ -689,11 +705,11 @@ impl Wizard {
     #[allow(deprecated)] // FileChooserNative is what GTK 4.8 (Debian 12, Ubuntu 22.04) offers.
     fn browse(self: &Rc<Self>) {
         let dialog = gtk::FileChooserNative::new(
-            Some("Choose a folder for iCloud Drive"),
+            Some(tr("Choose a folder for iCloud Drive")),
             Some(&self.window),
             gtk::FileChooserAction::SelectFolder,
-            Some("Choose"),
-            Some("Cancel"),
+            Some(tr("Choose")),
+            Some(tr("Cancel")),
         );
         let weak = Rc::downgrade(self);
         dialog.connect_response(move |dialog, response| {

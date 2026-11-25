@@ -179,6 +179,8 @@ install.sh           the curl | sh installer.
 tools/ci/            container recipes for Linux tests and installer screenshots.
 ```
 
+The installer speaks English and Italian, picked from `LANGUAGE`/`LC_ALL`/`LC_MESSAGES`/`LANG` like gettext. Its text goes through `icloud_core::i18n::tr` (or `trf` with `{}` placeholders); the Italian catalog is in `crates/icloud-core/src/i18n.rs`, and a test fails if a `tr`/`trf` text in the installer has no translation. The command line tool is English only for now.
+
 Everything that decides behaviour sits behind the `Drive` trait and `FsCore`, so it is tested without a network or a display. iCloud Notes, when it comes, is another service module in `icloud-api` next to `drive`, reached through the same `Client`.
 
 ```bash

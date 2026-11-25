@@ -23,6 +23,7 @@ use crate::{
     connect::client_for,
     dirs::Layout,
     error::{Error, Result},
+    i18n::{tr, tr_text, trf},
     setup::{self, Check, Severity, Systemctl},
 };
 
@@ -124,6 +125,20 @@ impl SystemBackend {
     }
 }
 
+/// A doctor check in the user's language. The doctor itself speaks English
+/// (the filter above reads its words), so the translation happens here.
+fn localized(mut check: Check) -> Check {
+    check.message = if let Some(path) = check.message.strip_suffix(" found") {
+        trf("{} found", &[&path])
+    } else if let Some(path) = check.message.strip_prefix("daemon: ") {
+        trf("daemon: {}", &[&path])
+    } else {
+        tr_text(&check.message)
+    };
+    check.fix = check.fix.map(|fix| tr_text(&fix));
+    check
+}
+
 /// Only what the wizard should stop the user for.
 fn blocking(check: &Check) -> bool {
     matches!(check.severity, Severity::Missing)
@@ -137,6 +152,7 @@ impl Backend for SystemBackend {
             .into_iter()
             .filter(|c| c.message.contains("fuse") || c.message.contains("daemon") || c.message.contains("FUSE"))
             .filter(|c| blocking(c) || c.severity == Severity::Ok)
+            .map(localized)
             .collect()
     }
 
@@ -166,41 +182,41 @@ impl Backend for SystemBackend {
         let started = setup::start(&self.layout, &*self.sys);
         let started_ok = started.is_ok();
         steps.push(match started {
-            Ok(()) => StepOutcome::ok("Start the iCloud service", "running"),
-            Err(err) => StepOutcome::failed("Start the iCloud service", err),
+            Ok(()) => StepOutcome::ok(tr("Start the iCloud service"), tr("running")),
+            Err(err) => StepOutcome::failed(tr("Start the iCloud service"), err),
         });
         if !started_ok {
             return steps;
         }
 
         steps.push(if wait_until_mounted(mount_dir, Duration::from_secs(30)) {
-            StepOutcome::ok("Mount iCloud Drive", mount_dir.display().to_string())
+            StepOutcome::ok(tr("Mount iCloud Drive"), mount_dir.display().to_string())
         } else {
             StepOutcome::failed(
-                "Mount iCloud Drive",
-                format!("{} did not appear; see `icloudctl logs`", mount_dir.display()),
+                tr("Mount iCloud Drive"),
+                trf("{} did not appear; see `icloudctl logs`", &[&mount_dir.display()]),
             )
         });
 
         if plan.keep_indexer_out {
             steps.push(match self.config().and_then(|c| setup::apply_trackerignore(&c)) {
-                Ok(_) => StepOutcome::ok("Keep the search indexer out", "done"),
-                Err(err) => StepOutcome::failed("Keep the search indexer out", err),
+                Ok(_) => StepOutcome::ok(tr("Keep the search indexer out"), tr("done")),
+                Err(err) => StepOutcome::failed(tr("Keep the search indexer out"), err),
             });
         }
         if plan.show_sidebar_status {
             steps.push(match setup::install_status_service(&self.layout, &*self.sys) {
-                Ok(_) => StepOutcome::ok("Show activity in the Files sidebar", "appears next to iCloud"),
-                Err(err) => StepOutcome::failed("Show activity in the Files sidebar", err),
+                Ok(_) => StepOutcome::ok(tr("Show activity in the Files sidebar"), tr("appears next to iCloud")),
+                Err(err) => StepOutcome::failed(tr("Show activity in the Files sidebar"), err),
             });
         }
         if plan.add_context_menu {
             steps.push(match setup::install_menu_here(&self.layout) {
                 Ok(_) => StepOutcome::ok(
-                    "Add \"Download from iCloud\" to the right-click menu",
-                    "right-click a file, then Scripts",
+                    tr("Add \"Download from iCloud\" to the right-click menu"),
+                    tr("right-click a file, then Scripts"),
                 ),
-                Err(err) => StepOutcome::failed("Add \"Download from iCloud\" to the right-click menu", err),
+                Err(err) => StepOutcome::failed(tr("Add \"Download from iCloud\" to the right-click menu"), err),
             });
         }
         steps
@@ -244,19 +260,19 @@ pub fn code_is_complete(code: &str) -> bool {
 /// The plan's mount folder must be somewhere the daemon can mount.
 pub fn validate_mount_dir(dir: &Path, layout: &Layout) -> std::result::Result<(), String> {
     if !dir.is_absolute() {
-        return Err("Choose a full folder path.".into());
+        return Err(tr("Choose a full folder path.").into());
     }
     if dir == layout.home || dir == Path::new("/") {
-        return Err("Choose a folder inside your home directory, not the home directory itself.".into());
+        return Err(tr("Choose a folder inside your home directory, not the home directory itself.").into());
     }
     if dir.exists() && !dir.is_dir() {
-        return Err("That path is a file, not a folder.".into());
+        return Err(tr("That path is a file, not a folder.").into());
     }
     if dir.is_dir()
         && std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
         && !setup::is_mounted(dir)
     {
-        return Err("That folder is not empty. Pick an empty folder or a new name.".into());
+        return Err(tr("That folder is not empty. Pick an empty folder or a new name.").into());
     }
     Ok(())
 }

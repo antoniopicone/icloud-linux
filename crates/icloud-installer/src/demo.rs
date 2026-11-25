@@ -6,6 +6,7 @@ use std::{collections::VecDeque, path::Path, thread, time::Duration};
 use icloud_api::{AccountInfo, Error as ApiError, LoginStatus, TrustedPhone, TwoFactorOptions};
 use icloud_core::{
     Result,
+    i18n::{tr, trf},
     installer::{Authenticator, Backend, InstallPlan, Prepared, StepOutcome},
     setup::{Check, Severity},
 };
@@ -64,9 +65,9 @@ impl Authenticator for DemoAuth {
 impl Backend for DemoBackend {
     fn preflight(&self) -> Vec<Check> {
         vec![
-            Check { severity: Severity::Ok, message: "/dev/fuse is present".into(), fix: None },
-            Check { severity: Severity::Ok, message: "/usr/bin/fusermount3 found".into(), fix: None },
-            Check { severity: Severity::Ok, message: "daemon: /usr/local/bin/icloudd".into(), fix: None },
+            Check { severity: Severity::Ok, message: tr("/dev/fuse is present").into(), fix: None },
+            Check { severity: Severity::Ok, message: trf("{} found", &[&"/usr/bin/fusermount3"]), fix: None },
+            Check { severity: Severity::Ok, message: trf("daemon: {}", &[&"/usr/local/bin/icloudd"]), fix: None },
         ]
     }
 
@@ -112,19 +113,19 @@ impl Backend for DemoBackend {
             StepOutcome { title: title.to_owned(), result: Ok(detail) }
         };
         let mut steps = vec![
-            step("Start the iCloud service", "running".into()),
-            step("Mount iCloud Drive", mount_dir.display().to_string()),
+            step(tr("Start the iCloud service"), tr("running").into()),
+            step(tr("Mount iCloud Drive"), mount_dir.display().to_string()),
         ];
         if plan.keep_indexer_out {
-            steps.push(step("Keep the search indexer out", "done".into()));
+            steps.push(step(tr("Keep the search indexer out"), tr("done").into()));
         }
         if plan.show_sidebar_status {
-            steps.push(step("Show activity in the Files sidebar", "appears next to iCloud".into()));
+            steps.push(step(tr("Show activity in the Files sidebar"), tr("appears next to iCloud").into()));
         }
         if plan.add_context_menu {
             steps.push(step(
-                "Add \"Download from iCloud\" to the right-click menu",
-                "right-click a file, then Scripts".into(),
+                tr("Add \"Download from iCloud\" to the right-click menu"),
+                tr("right-click a file, then Scripts").into(),
             ));
         }
         steps
