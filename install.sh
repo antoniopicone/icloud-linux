@@ -10,9 +10,11 @@
 # What it does, in order:
 #   1. installs build and run-time packages with your package manager (sudo,
 #      after asking) - only the ones that are missing;
-#   2. installs a Rust toolchain with rustup (asks first) if `cargo` is missing
-#      or older than 1.88;
-#   3. downloads the source from GitHub and builds it in release mode;
+#   2. downloads the source from GitHub;
+#   3. installs a Rust toolchain with rustup (asks first) if `cargo` is missing
+#      or older than 1.88, and builds in release mode. The checkout's
+#      rust-toolchain.toml selects the toolchain for this build only: your default
+#      toolchain is left as it is;
 #   4. installs icloudctl, icloudd, icloud-status and icloud-installer into
 #      ~/.local/bin, plus an entry in the applications menu;
 #   5. starts the guided setup: the window if there is a desktop, otherwise the
@@ -119,6 +121,20 @@ Options:
 Environment: ICLOUD_LINUX_REPO, ICLOUD_LINUX_REF, ICLOUD_LINUX_SRC (use an
 existing checkout instead of downloading), PREFIX.
 EOF_USAGE
+}
+
+# Another iCloud Drive client on the same account (icloud-for-omarchy's
+# icloud-drive.service) would fight this one over every change. Say so early;
+# stopping it is the user's call.
+warn_competing_clients() {
+    have systemctl || return 0
+    for unit in icloud-drive.service; do
+        if systemctl --user is-enabled --quiet "$unit" 2>/dev/null || systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+            warn "$unit (another iCloud Drive client) is set up. Two clients on one drive fight over every change."
+            note "Stop it first: systemctl --user disable --now $unit"
+            note "(on Omarchy it comes with icloud-for-omarchy: sudo pacman -R icloud-drive)"
+        fi
+    done
 }
 
 # ---- arguments ----------------------------------------------------------------------
@@ -245,10 +261,11 @@ install_packages() {
 
 # ---- Rust -------------------------------------------------------------------------------------
 
-# Minor version of the cargo on PATH, or 0.
+# Minor version of the cargo that builds $SRC, or 0. Run inside the source
+# tree so that rustup honours its rust-toolchain.toml.
 cargo_minor() {
     have cargo || { echo 0; return; }
-    ver=$(cargo --version 2>/dev/null | sed -n 's/^cargo 1\.\([0-9][0-9]*\)\..*/\1/p')
+    ver=$(cd "$SRC" && cargo --version 2>/dev/null | sed -n 's/^cargo 1\.\([0-9][0-9]*\)\..*/\1/p')
     echo "${ver:-0}"
 }
 
@@ -264,9 +281,14 @@ ensure_rust() {
     fi
 
     if have rustup; then
-        say "Rust: updating the toolchain (cargo 1.$minor is too old, 1.$MIN_RUST_MINOR needed)"
-        rustup update stable --no-self-update >/dev/null 2>&1 || rustup toolchain install stable --profile minimal
-        rustup default stable >/dev/null 2>&1 || true
+        # Install the toolchain that rust-toolchain.toml names, next to
+        # whatever is there; the file selects it for this build. `rustup
+        # default` is not touched: other projects may rely on theirs.
+        channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$SRC/rust-toolchain.toml" 2>/dev/null)
+        channel=${channel:-stable}
+        say "Rust: installing toolchain $channel for this build (cargo 1.$minor is too old, 1.$MIN_RUST_MINOR needed)"
+        rustup toolchain install "$channel" --profile minimal -c rustfmt -c clippy --no-self-update >/dev/null \
+            || die "rustup could not install the $channel toolchain."
     else
         say "Rust: cargo 1.$MIN_RUST_MINOR or newer is needed and was not found"
         note "I can install rustup (https://sh.rustup.rs) into ~/.cargo. It does not touch your shell profile."
@@ -478,9 +500,10 @@ main() {
         warn "no systemd user session detected: the service cannot be started from here. Log in to a normal desktop session for the guided setup."
     fi
 
+    warn_competing_clients
     install_packages
-    ensure_rust
     fetch_source
+    ensure_rust
     build
     install_files
     restart_running_services

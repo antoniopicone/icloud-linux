@@ -583,6 +583,27 @@ impl Check {
     }
 }
 
+/// User services of other iCloud Drive clients that sync the same account.
+/// Two clients on one drive upload each other's changes back and forth and
+/// turn every edit into a conflict, so neither should run next to this one.
+/// `icloud-drive.service` is icloud-for-omarchy's.
+pub const COMPETING_SERVICES: &[&str] = &["icloud-drive.service"];
+
+/// The competing services that are running or start at login.
+pub fn competing_services(sys: &dyn Systemctl) -> Vec<&'static str> {
+    COMPETING_SERVICES
+        .iter()
+        .copied()
+        .filter(|unit| {
+            sys.run(&["show", "--property=ActiveState,UnitFileState", unit]).is_ok_and(|out| {
+                out.stdout.lines().any(|line| {
+                    matches!(line.trim(), "ActiveState=active" | "ActiveState=activating" | "UnitFileState=enabled")
+                })
+            })
+        })
+        .collect()
+}
+
 /// Look at the installation and say what is wrong with it.
 pub fn doctor(layout: &Layout, sys: &dyn Systemctl) -> Vec<Check> {
     let mut checks = Vec::new();
@@ -656,6 +677,11 @@ pub fn doctor(layout: &Layout, sys: &dyn Systemctl) -> Vec<Check> {
     } else {
         Check::new(Severity::Info, "service is not running")
     });
+    for unit in competing_services(sys) {
+        checks.push(Check::new(Severity::Warn, format!("another iCloud Drive client is set up: {unit}")).with_fix(
+            format!("systemctl --user disable --now {unit} (two clients on one drive fight over every change)"),
+        ));
+    }
 
     if let Some(config) = &config {
         checks.push(session_check(config));
@@ -1154,6 +1180,32 @@ mod tests {
         let checks = doctor(&layout, &sys);
         assert!(has(&checks, Severity::Warn, "readable by other users"));
         assert!(has(&checks, Severity::Info, "password is stored"));
+    }
+
+    #[test]
+    fn doctor_warns_about_another_icloud_drive_client() {
+        struct Other(&'static str);
+        impl Systemctl for Other {
+            fn run(&self, args: &[&str]) -> io::Result<CommandOutput> {
+                let stdout = if args.first() == Some(&"show") && args.last() == Some(&"icloud-drive.service") {
+                    self.0.to_owned()
+                } else {
+                    String::new()
+                };
+                Ok(CommandOutput { success: true, stdout, stderr: String::new() })
+            }
+        }
+        let (_d, layout, _sys) = setup();
+        let quiet = Other("ActiveState=inactive\nUnitFileState=disabled\n");
+        assert!(competing_services(&quiet).is_empty());
+        assert!(!has(&doctor(&layout, &quiet), Severity::Warn, "another iCloud Drive client"));
+        for state in ["ActiveState=active\nUnitFileState=disabled\n", "ActiveState=inactive\nUnitFileState=enabled\n"] {
+            let other = Other(state);
+            assert_eq!(competing_services(&other), ["icloud-drive.service"], "{state}");
+            assert!(has(&doctor(&layout, &other), Severity::Warn, "another iCloud Drive client"));
+        }
+        // Not installed at all: systemctl answers with an empty or "not-found" unit.
+        assert!(competing_services(&Other("ActiveState=inactive\nUnitFileState=\n")).is_empty());
     }
 
     #[test]

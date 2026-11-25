@@ -39,6 +39,7 @@ cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
 cast_precision_loss = "allow"
+assert_is_empty = "allow"        # new in 1.100; `assert!(v.is_empty())` reads fine
 # Style lints whose "fix" would make the code less readable here.
 unused_self = "allow"           # methods kept as methods for a uniform call style
 struct_field_names = "allow"

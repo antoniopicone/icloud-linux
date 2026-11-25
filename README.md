@@ -33,7 +33,7 @@ Linux only. FUSE 3 and systemd (user services) are required.
 curl -fsSL https://raw.githubusercontent.com/antoniopicone/icloud-linux/master/install.sh | sh
 ```
 
-It installs what is missing (system packages through `sudo` after asking, a Rust toolchain through rustup after asking), downloads the source, builds it, installs `icloudctl`, `icloudd`, `icloud-status` and `icloud-installer` into `~/.local/bin` with an entry in the applications menu, and starts the guided setup: the window if you are on a desktop, the terminal version otherwise. It refuses to run as root, touches nothing outside your home directory except those packages, and does not repeat the sign-in if you are already set up, so running it again is how you update.
+It installs what is missing (system packages through `sudo` after asking, a Rust toolchain through rustup after asking; the checkout's `rust-toolchain.toml` selects it for this build only and leaves your default toolchain alone), downloads the source, builds it, installs `icloudctl`, `icloudd`, `icloud-status` and `icloud-installer` into `~/.local/bin` with an entry in the applications menu, and starts the guided setup: the window if you are on a desktop, the terminal version otherwise. It refuses to run as root, touches nothing outside your home directory except those packages, and does not repeat the sign-in if you are already set up, so running it again is how you update.
 
 ```bash
 curl -fsSL …/install.sh | sh -s -- --yes --no-run     # unattended, no setup afterwards

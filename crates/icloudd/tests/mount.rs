@@ -393,8 +393,10 @@ fn cat_named(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// Read `file` with the program at `program`; the error text when it fails.
+/// In the C locale, so the text is "Permission denied" whatever the desktop's
+/// language is.
 fn read_with(program: &Path, file: &Path) -> Result<Vec<u8>, String> {
-    let out = std::process::Command::new(program).arg(file).output().unwrap();
+    let out = std::process::Command::new(program).arg(file).env("LC_ALL", "C").output().unwrap();
     if out.status.success() { Ok(out.stdout) } else { Err(String::from_utf8_lossy(&out.stderr).into_owned()) }
 }
 

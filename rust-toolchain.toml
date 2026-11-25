@@ -1,0 +1,9 @@
+# The toolchain for this checkout only: rustup picks it up inside this
+# directory and leaves the system-wide default alone. The workspace needs
+# 1.88 or newer (edition 2024 let-chains; see rust-version in Cargo.toml).
+# Pinned so that local builds, install.sh and CI use the same compiler and
+# the same clippy lints; raise it on purpose.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
