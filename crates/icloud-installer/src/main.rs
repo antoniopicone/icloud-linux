@@ -1,20 +1,21 @@
 //! `icloud-installer`: a guided setup for icloud-linux.
 //!
-//! Walks through the same steps as `icloudctl init`, `configure`, `auth` and
-//! `start`, including the two-factor code, in a GTK4 window.
+//! Walks through the same steps as `icloudctl init`, `configure`,
+//! `auth --from-browser` and `start`, in a libadwaita window.
 //!
-//! `--demo` runs the whole wizard against a pretend system (verification code
-//! `123456`, password `wrong` fails, `trusted` skips two-factor) so it can be
-//! tried without an Apple account and without changing anything.
+//! `--demo` runs the whole wizard against a pretend system (the sign-in is
+//! pretended too) so it can be tried without an Apple account and without
+//! changing anything.
 
 mod demo;
 mod wizard;
 
 use std::sync::Arc;
 
-use gtk::{gio, glib, prelude::*};
-use gtk4 as gtk;
+use adw::prelude::*;
+use gtk4::{gio, glib};
 use icloud_core::{Layout, installer::Backend, setup::RealSystemctl};
+use libadwaita as adw;
 
 const APP_ID: &str = "org.icloud_linux.Installer";
 
@@ -56,7 +57,7 @@ fn main() -> glib::ExitCode {
         Arc::new(icloud_core::installer::SystemBackend::new(layout.clone(), Arc::new(RealSystemctl)))
     };
 
-    let app = gtk::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::NON_UNIQUE).build();
+    let app = adw::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::NON_UNIQUE).build();
     app.connect_activate(move |app| {
         wizard::present(app, Arc::clone(&backend), layout.clone(), demo, start_page.clone());
     });

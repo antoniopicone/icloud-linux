@@ -177,18 +177,18 @@ missing_tools() {
     have pkg-config || missing="$missing pkg-config"
     have cmake || missing="$missing cmake"
     have fusermount3 || have fusermount || missing="$missing fuse"
-    if [ "$GUI" = 1 ] && have pkg-config && ! pkg-config --exists gtk4 2>/dev/null; then
-        missing="$missing gtk4-dev"
+    if [ "$GUI" = 1 ] && have pkg-config && ! pkg-config --exists gtk4 libadwaita-1 2>/dev/null; then
+        missing="$missing gtk4/libadwaita-dev"
     fi
     echo "$missing"
 }
 
 package_list() {
     case $1 in
-        apt-get) pkgs="build-essential pkg-config cmake curl ca-certificates fuse3"; gui="libgtk-4-dev" ;;
-        dnf)     pkgs="gcc gcc-c++ make pkgconf-pkg-config cmake curl fuse3";       gui="gtk4-devel" ;;
-        pacman)  pkgs="base-devel cmake curl fuse3";                                 gui="gtk4" ;;
-        zypper)  pkgs="gcc gcc-c++ make pkg-config cmake curl fuse3";                gui="gtk4-devel" ;;
+        apt-get) pkgs="build-essential pkg-config cmake curl ca-certificates fuse3"; gui="libgtk-4-dev libadwaita-1-dev" ;;
+        dnf)     pkgs="gcc gcc-c++ make pkgconf-pkg-config cmake curl fuse3";       gui="gtk4-devel libadwaita-devel" ;;
+        pacman)  pkgs="base-devel cmake curl fuse3";                                 gui="gtk4 libadwaita" ;;
+        zypper)  pkgs="gcc gcc-c++ make pkg-config cmake curl fuse3";                gui="gtk4-devel libadwaita-devel" ;;
         *)       pkgs=""; gui="" ;;
     esac
     if [ "$GUI" = 1 ]; then
@@ -216,7 +216,7 @@ install_packages() {
     if ! pm=$(detect_package_manager); then
         wanted="a C compiler, pkg-config, cmake and fuse3"
         if [ "$GUI" = 1 ]; then
-            wanted="$wanted, and GTK 4 development files (or use --no-gui)"
+            wanted="$wanted, and GTK 4 and libadwaita development files (or use --no-gui)"
         fi
         die "missing:$need. I do not know this system's package manager; install $wanted, then run again with --no-deps."
     fi
@@ -237,8 +237,8 @@ install_packages() {
     esac
 
     # The GUI is a nicety: without GTK the command line setup still works.
-    if [ "$GUI" = 1 ] && ! pkg-config --exists gtk4 2>/dev/null; then
-        warn "GTK 4 development files are still missing; building without the installer window."
+    if [ "$GUI" = 1 ] && ! pkg-config --exists gtk4 libadwaita-1 2>/dev/null; then
+        warn "GTK 4 or libadwaita development files are still missing; building without the installer window."
         GUI=0
     fi
 }

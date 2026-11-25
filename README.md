@@ -52,7 +52,7 @@ cd icloud-linux
 ./install.sh            # builds and installs this checkout
 ```
 
-or by hand, if you would rather not use the script. Build needs Rust 1.88+, a C compiler, `pkg-config`, `cmake` and (for the window) GTK 4 development files; at run time `fuse3` and `systemd --user`:
+or by hand, if you would rather not use the script. Build needs Rust 1.88+, a C compiler, `pkg-config`, `cmake` and (for the window) GTK 4 and libadwaita (1.2 or newer) development files; at run time `fuse3` and `systemd --user`:
 
 ```bash
 cargo build --release
@@ -174,7 +174,7 @@ crates/
   icloudd/           the FUSE daemon (a thin adapter over icloud-core).
   icloudctl/         the command line tool.
   icloud-status/     the sidebar label watcher (its logic lives in icloud-core::status).
-  icloud-installer/  the GTK4 window (a view over icloud-core's installer logic).
+  icloud-installer/  the GTK4/libadwaita window (a view over icloud-core's installer logic).
 install.sh           the curl | sh installer.
 tools/ci/            container recipes for Linux tests and installer screenshots.
 ```

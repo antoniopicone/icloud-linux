@@ -1,9 +1,13 @@
-//! The installer window: six pages over the logic in `icloud_core::installer`.
+//! The installer window: five pages over the logic in `icloud_core::installer`.
+//!
+//! Built from libadwaita's widgets and style classes only, with no colours or
+//! fonts of its own, so it looks like the rest of the desktop: native on
+//! GNOME, and elsewhere whatever the user's GTK theme or `gtk.css` makes it.
 //!
 //! Every page is a view. What the buttons *do* (validate, write files, sign
 //! in, start the service) is done by a [`Backend`] on a background thread, and
 //! the results come back through small polling timers, so the window never
-//! freezes on `systemctl` or on Apple's servers.
+//! freezes on `systemctl`, on the browser or on Apple's servers.
 
 use std::{
     cell::RefCell,
@@ -12,7 +16,8 @@ use std::{
     time::Duration,
 };
 
-use gtk::{gio, glib, prelude::*};
+use adw::prelude::*;
+use gtk::{gio, glib};
 use gtk4 as gtk;
 use icloud_api::AccountInfo;
 use icloud_core::{
@@ -21,6 +26,7 @@ use icloud_core::{
     installer::{Backend, InstallPlan, Prepared, StepOutcome, validate_mount_dir},
     setup::Severity,
 };
+use libadwaita as adw;
 
 thread_local! {
     /// The callbacks hold only weak references (so nothing leaks through a
@@ -29,24 +35,15 @@ thread_local! {
     static ALIVE: RefCell<Option<Rc<Wizard>>> = const { RefCell::new(None) };
 }
 
+const TITLE: &str = "iCloud for Linux";
+
 const STEPS: [(&str, &str); 5] = [
     ("welcome", "Requirements"),
     ("folder", "Folder"),
-    ("account", "Apple ID"),
+    ("account", "Sign in"),
     ("install", "Setting up"),
     ("done", "Done"),
 ];
-
-const CSS: &str = "
-.page-title { font-size: 22pt; font-weight: 800; }
-.page-subtitle { opacity: 0.75; }
-.step-indicator { opacity: 0.6; font-size: 9pt; letter-spacing: 1px; }
-.check-ok { color: #2e9e5b; font-weight: 700; }
-.check-bad { color: #c0392b; font-weight: 700; }
-.error-text { color: #c0392b; }
-.note-text { opacity: 0.7; font-size: 9pt; }
-.step-row { padding: 6px 0; }
-";
 
 /// Run `work` on a thread and hand its result to `done` on the main loop.
 fn background<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static, done: impl FnOnce(T) + 'static) {
@@ -75,36 +72,77 @@ fn label(text: &str, classes: &[&str]) -> gtk::Label {
     label
 }
 
-/// The ✓ or ✗ in front of a line. It must not expand, or it would share the
-/// row's width with the text beside it.
-fn status_icon(ok: bool) -> gtk::Label {
-    let icon = gtk::Label::builder().label(if ok { "✓" } else { "✗" }).xalign(0.5).valign(gtk::Align::Start).build();
-    icon.add_css_class(if ok { "check-ok" } else { "check-bad" });
+/// A message line under a form: hidden until something needs saying.
+fn message_label() -> gtk::Label {
+    let message = label("", &[]);
+    message.set_visible(false);
+    message
+}
+
+/// A ✓ or ⚠ in front of a row, coloured by the theme.
+fn status_icon(ok: bool) -> gtk::Image {
+    let icon = gtk::Image::from_icon_name(if ok { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" });
+    icon.add_css_class(if ok { "success" } else { "error" });
     icon
 }
 
-fn page(title: &str, subtitle: &str) -> gtk::Box {
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
-    page.set_margin_top(28);
-    page.set_margin_bottom(24);
-    page.set_margin_start(36);
-    page.set_margin_end(36);
-    page.append(&label(title, &["page-title"]));
-    if !subtitle.is_empty() {
-        page.append(&label(subtitle, &["page-subtitle"]));
-    }
-    page
+/// A row of a boxed list. Titles may hold paths and Apple's messages, so they
+/// are never parsed as markup.
+fn row(title: &str, subtitle: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(title).subtitle(subtitle).build();
+    row.set_use_markup(false);
+    row
 }
 
-fn button_row(buttons: &[&gtk::Button]) -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+fn boxed_list() -> gtk::ListBox {
+    let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+    list.add_css_class("boxed-list");
+    list
+}
+
+fn clear(list: &gtk::ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+}
+
+/// A page: its content, which takes the free height, above a row of buttons.
+fn page(content: &impl IsA<gtk::Widget>, buttons: &[&gtk::Button]) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.set_vexpand(true);
+    page.append(content);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.set_halign(gtk::Align::End);
-    row.set_valign(gtk::Align::End);
-    row.set_vexpand(true);
+    row.set_margin_top(12);
+    row.set_margin_bottom(18);
+    row.set_margin_start(18);
+    row.set_margin_end(18);
     for button in buttons {
         row.append(*button);
     }
-    row
+    page.append(&row);
+    page
+}
+
+/// Scrolling, width-limited content under a title, for the form-like pages.
+fn form(title: &str, description: &str) -> (gtk::ScrolledWindow, gtk::Box) {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    content.set_margin_top(24);
+    content.set_margin_bottom(24);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+    content.append(&label(title, &["title-1"]));
+    if !description.is_empty() {
+        content.append(&label(description, &["dim-label"]));
+    }
+    let clamp = adw::Clamp::builder().maximum_size(560).child(&content).build();
+    let scrolled = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).child(&clamp).build();
+    (scrolled, content)
+}
+
+/// Keep a status page's content as narrow as its description.
+fn narrow(child: &impl IsA<gtk::Widget>) -> adw::Clamp {
+    adw::Clamp::builder().maximum_size(480).child(child).build()
 }
 
 fn primary(text: &str) -> gtk::Button {
@@ -124,7 +162,7 @@ impl Busy {
     fn new() -> Self {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let spinner = gtk::Spinner::new();
-        let text = label("", &["page-subtitle"]);
+        let text = label("", &["dim-label"]);
         row.append(&spinner);
         row.append(&text);
         row.set_visible(false);
@@ -145,14 +183,14 @@ impl Busy {
 
 struct Widgets {
     // welcome
-    checks: gtk::Box,
+    checks: gtk::ListBox,
     welcome_next: gtk::Button,
     // folder
-    folder_entry: gtk::Entry,
+    folder_entry: adw::EntryRow,
     lazy: gtk::CheckButton,
-    indexer: gtk::CheckButton,
-    sidebar: gtk::CheckButton,
-    menu: gtk::CheckButton,
+    indexer: gtk::Switch,
+    sidebar: gtk::Switch,
+    menu: gtk::Switch,
     folder_message: gtk::Label,
     folder_busy: Busy,
     folder_next: gtk::Button,
@@ -161,18 +199,17 @@ struct Widgets {
     account_busy: Busy,
     sign_in: gtk::Button,
     // install / done
-    steps: gtk::Box,
+    steps: gtk::ListBox,
     install_busy: Busy,
     install_next: gtk::Button,
-    done_title: gtk::Label,
-    done_body: gtk::Label,
+    done: adw::StatusPage,
     open_folder: gtk::Button,
 }
 
 struct Wizard {
-    window: gtk::ApplicationWindow,
+    window: adw::ApplicationWindow,
     stack: gtk::Stack,
-    step: gtk::Label,
+    title: adw::WindowTitle,
     backend: Arc<dyn Backend>,
     layout: Layout,
     plan: RefCell<InstallPlan>,
@@ -184,42 +221,37 @@ struct Wizard {
 }
 
 pub(crate) fn present(
-    app: &gtk::Application,
+    app: &adw::Application,
     backend: Arc<dyn Backend>,
     layout: Layout,
     demo: bool,
     start_page: Option<String>,
 ) {
-    if let Some(display) = gtk::gdk::Display::default() {
-        let provider = gtk::CssProvider::new();
-        provider.load_from_data(CSS);
-        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-    }
-
-    let window = gtk::ApplicationWindow::builder()
-        .application(app)
-        .title(if demo { "iCloud for Linux — demo" } else { "iCloud for Linux" })
-        .default_width(640)
-        .default_height(600)
-        .build();
     let stack =
         gtk::Stack::builder().transition_type(gtk::StackTransitionType::SlideLeft).transition_duration(180).build();
-    let step = label("", &["step-indicator"]);
-    step.set_margin_top(14);
-    step.set_margin_start(36);
+    let title = adw::WindowTitle::new(if demo { "iCloud for Linux — demo" } else { TITLE }, "");
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&title));
 
     let plan = InstallPlan::recommended(&layout);
     let widgets = build_pages(&stack, &plan, demo);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.append(&step);
+    root.append(&header);
     root.append(&stack);
     stack.set_vexpand(true);
-    window.set_child(Some(&root));
+
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title(TITLE)
+        .default_width(640)
+        .default_height(640)
+        .content(&root)
+        .build();
 
     let wizard = Rc::new(Wizard {
         window: window.clone(),
         stack,
-        step,
+        title,
         backend,
         layout,
         plan: RefCell::new(plan),
@@ -247,121 +279,153 @@ pub(crate) fn present(
 
 fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
     // welcome
-    let welcome = page(
-        "Welcome to iCloud for Linux",
-        "This sets up iCloud Drive as a normal folder on this computer. Files download when you open them, and changes you make are uploaded for you.",
-    );
+    let welcome_content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let checks = boxed_list();
+    welcome_content.append(&checks);
     if demo {
-        welcome.append(&label(
+        welcome_content.append(&label(
             "Demo mode: nothing on this computer is changed, and no browser opens: the sign-in is pretended.",
-            &["note-text"],
+            &["caption", "dim-label"],
         ));
     }
-    let checks = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    welcome.append(&checks);
+    let welcome = adw::StatusPage::builder()
+        .icon_name("weather-overcast-symbolic")
+        .title("Welcome to iCloud for Linux")
+        .description(
+            "This sets up iCloud Drive as a normal folder on this computer. Files download when you open them, \
+             and changes you make are uploaded for you.",
+        )
+        .child(&narrow(&welcome_content))
+        .build();
     let welcome_quit = gtk::Button::with_label("Quit");
-    let recheck = gtk::Button::with_label("Check again");
+    let recheck = gtk::Button::with_label("Check Again");
     let welcome_next = primary("Continue");
-    welcome.append(&button_row(&[&welcome_quit, &recheck, &welcome_next]));
-    stack.add_named(&welcome, Some("welcome"));
+    stack.add_named(&page(&welcome, &[&welcome_quit, &recheck, &welcome_next]), Some("welcome"));
 
     // folder
-    let folder = page("Where should iCloud Drive appear?", "Pick an empty folder. It will show your iCloud files.");
-    let folder_entry = gtk::Entry::builder().text(plan.mount_dir.to_string_lossy().as_ref()).hexpand(true).build();
-    let browse = gtk::Button::with_label("Browse…");
-    let folder_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    folder_row.append(&folder_entry);
-    folder_row.append(&browse);
-    folder.append(&folder_row);
-    folder.append(&label("How should it work?", &["heading"]));
-    let lazy = gtk::CheckButton::with_label("Open folders on demand (recommended) — fast to start, uses little disk");
-    let full =
-        gtk::CheckButton::with_label("Index everything up front — slower start, lets you search the whole drive");
+    let (folder_scroll, folder) =
+        form("Where should iCloud Drive appear?", "Pick an empty folder. It will show your iCloud files.");
+    let location = adw::PreferencesGroup::new();
+    let folder_entry = adw::EntryRow::builder().title("Folder").text(plan.mount_dir.to_string_lossy().as_ref()).build();
+    let browse = gtk::Button::from_icon_name("folder-open-symbolic");
+    browse.set_tooltip_text(Some("Choose a folder"));
+    browse.set_valign(gtk::Align::Center);
+    browse.add_css_class("flat");
+    folder_entry.add_suffix(&browse);
+    location.add(&folder_entry);
+    folder.append(&location);
+
+    let mode = adw::PreferencesGroup::builder().title("How should it work?").build();
+    let lazy = gtk::CheckButton::new();
+    let full = gtk::CheckButton::new();
     full.set_group(Some(&lazy));
     lazy.set_active(plan.crawl_mode == CrawlMode::Lazy);
     full.set_active(plan.crawl_mode == CrawlMode::Full);
-    folder.append(&lazy);
-    folder.append(&full);
-    let indexer =
-        gtk::CheckButton::with_label("Keep the desktop search indexer from downloading everything (recommended)");
-    indexer.set_active(plan.keep_indexer_out);
-    let sidebar = gtk::CheckButton::with_label("Show what iCloud is doing next to it in the Files sidebar");
-    sidebar.set_active(plan.show_sidebar_status);
-    let menu = gtk::CheckButton::with_label("Add \"Download from iCloud\" to the right-click menu of Files");
-    menu.set_active(plan.add_context_menu);
-    folder.append(&indexer);
-    folder.append(&sidebar);
-    folder.append(&menu);
-    let folder_message = label("", &["error-text"]);
+    for (check, title, subtitle) in [
+        (&lazy, "Open folders on demand", "Recommended. Fast to start, uses little disk."),
+        (&full, "Index everything up front", "Slower to start; lets you search the whole drive."),
+    ] {
+        let option = row(title, subtitle);
+        check.set_valign(gtk::Align::Center);
+        option.add_prefix(check);
+        option.set_activatable_widget(Some(check));
+        mode.add(&option);
+    }
+    folder.append(&mode);
+
+    let extras = adw::PreferencesGroup::builder().title("Extras").build();
+    let switch = |active: bool| gtk::Switch::builder().active(active).valign(gtk::Align::Center).build();
+    let indexer = switch(plan.keep_indexer_out);
+    let sidebar = switch(plan.show_sidebar_status);
+    let menu = switch(plan.add_context_menu);
+    for (toggle, title, subtitle) in [
+        (
+            &indexer,
+            "Keep the search indexer out",
+            "Stops desktop search from downloading the whole drive. Recommended.",
+        ),
+        (&sidebar, "Show activity in the Files sidebar", "What iCloud is doing appears next to its name."),
+        (&menu, "Add “Download from iCloud” to Files", "In the right-click menu, to keep files on this computer."),
+    ] {
+        let option = row(title, subtitle);
+        option.add_suffix(toggle);
+        option.set_activatable_widget(Some(toggle));
+        extras.add(&option);
+    }
+    folder.append(&extras);
+    let folder_message = message_label();
     folder.append(&folder_message);
     let folder_busy = Busy::new();
     folder.append(&folder_busy.row);
     let folder_back = gtk::Button::with_label("Back");
     let folder_next = primary("Continue");
-    folder.append(&button_row(&[&folder_back, &folder_next]));
-    stack.add_named(&folder, Some("folder"));
+    stack.add_named(&page(&folder_scroll, &[&folder_back, &folder_next]), Some("folder"));
 
     // account
-    let account = page(
-        "Sign in to iCloud",
-        "You sign in on Apple's own page, in a browser window that opens for this. Your Apple ID, password and verification code are typed there and never reach this app.",
-    );
-    account.append(&label(
-        "When Apple asks whether to trust the browser, choose Trust: that is what keeps you signed in here. The window closes by itself when you are done. No password is stored; when the session expires, you sign in the same way again.",
-        &["note-text"],
-    ));
-    let account_message = label("", &["error-text"]);
-    account.append(&account_message);
+    let account_content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    let sign_in = primary("Sign In on icloud.com");
+    sign_in.add_css_class("pill");
+    sign_in.set_halign(gtk::Align::Center);
+    account_content.append(&sign_in);
     let account_busy = Busy::new();
-    account.append(&account_busy.row);
+    account_busy.row.set_halign(gtk::Align::Center);
+    account_content.append(&account_busy.row);
+    let account_message = message_label();
+    account_message.set_justify(gtk::Justification::Center);
+    account_message.set_xalign(0.5);
+    account_content.append(&account_message);
+    let account_note = label(
+        "When Apple asks whether to trust the browser, choose Trust: that keeps you signed in here. \
+         No password is stored; when the session expires, you sign in the same way again.",
+        &["caption", "dim-label"],
+    );
+    account_note.set_justify(gtk::Justification::Center);
+    account_note.set_xalign(0.5);
+    account_content.append(&account_note);
+    let account = adw::StatusPage::builder()
+        .icon_name("web-browser-symbolic")
+        .title("Sign in to iCloud")
+        .description(
+            "You sign in on Apple's own page, in a browser window that opens for this. Your Apple ID, password \
+             and verification code are typed there and never reach this app.",
+        )
+        .child(&narrow(&account_content))
+        .build();
     let account_back = gtk::Button::with_label("Back");
-    let sign_in = primary("Sign in on icloud.com");
-    account.append(&button_row(&[&account_back, &sign_in]));
-    stack.add_named(&account, Some("account"));
+    stack.add_named(&page(&account, &[&account_back]), Some("account"));
 
     // install
-    let install = page("Setting things up", "");
-    let steps = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let (install_scroll, install) = form("Setting things up", "");
+    let steps = boxed_list();
     install.append(&steps);
     let install_busy = Busy::new();
     install.append(&install_busy.row);
     let install_next = primary("Continue");
     install_next.set_sensitive(false);
-    install.append(&button_row(&[&install_next]));
-    stack.add_named(&install, Some("install"));
+    stack.add_named(&page(&install_scroll, &[&install_next]), Some("install"));
 
     // done
-    let done = page("", "");
-    let done_title = label("", &["page-title"]);
-    let done_body = label("", &["page-subtitle"]);
-    // `page` already added an (empty) title; replace it.
-    if let Some(first) = done.first_child() {
-        done.remove(&first);
-    }
-    done.append(&done_title);
-    done.append(&done_body);
+    let done = adw::StatusPage::builder().icon_name("emblem-ok-symbolic").build();
     let open_folder = primary("Open iCloud Drive");
     let close = gtk::Button::with_label("Close");
-    done.append(&button_row(&[&close, &open_folder]));
-    stack.add_named(&done, Some("done"));
+    stack.add_named(&page(&done, &[&close, &open_folder]), Some("done"));
 
-    // Buttons that only need the window are wired later; stash the ones the
-    // wiring needs by name through widget names.
+    // The wiring finds buttons by these names.
     for (button, name) in [
         (&welcome_quit, "welcome-quit"),
         (&recheck, "recheck"),
+        (&welcome_next, "welcome-next"),
         (&browse, "browse"),
         (&folder_back, "folder-back"),
+        (&folder_next, "folder-next"),
         (&account_back, "account-back"),
+        (&sign_in, "sign-in"),
+        (&install_next, "install-next"),
+        (&open_folder, "open-folder"),
         (&close, "close"),
     ] {
         button.set_widget_name(name);
     }
-    welcome_next.set_widget_name("welcome-next");
-    folder_next.set_widget_name("folder-next");
-    sign_in.set_widget_name("sign-in");
-    install_next.set_widget_name("install-next");
-    open_folder.set_widget_name("open-folder");
 
     Widgets {
         checks,
@@ -380,8 +444,7 @@ fn build_pages(stack: &gtk::Stack, plan: &InstallPlan, demo: bool) -> Widgets {
         steps,
         install_busy,
         install_next,
-        done_title,
-        done_body,
+        done,
         open_folder,
     }
 }
@@ -411,7 +474,7 @@ fn find_button(root: &gtk::Stack, name: &str) -> Option<gtk::Button> {
 impl Wizard {
     fn go(self: &Rc<Self>, page: &str) {
         let index = STEPS.iter().position(|(name, _)| *name == page).unwrap_or(0);
-        self.step.set_label(&format!("STEP {} OF {}  ·  {}", index + 1, STEPS.len(), STEPS[index].1.to_uppercase()));
+        self.title.set_subtitle(&format!("Step {} of {} · {}", index + 1, STEPS.len(), STEPS[index].1));
         self.stack.set_visible_child_name(page);
         if page == "install" {
             self.begin_install();
@@ -433,14 +496,16 @@ impl Wizard {
 
     fn show_error(label: &gtk::Label, text: &str) {
         label.set_label(text);
-        label.remove_css_class("note-text");
-        label.add_css_class("error-text");
+        label.remove_css_class("dim-label");
+        label.add_css_class("error");
+        label.set_visible(!text.is_empty());
     }
 
     fn show_note(label: &gtk::Label, text: &str) {
         label.set_label(text);
-        label.remove_css_class("error-text");
-        label.add_css_class("note-text");
+        label.remove_css_class("error");
+        label.add_css_class("dim-label");
+        label.set_visible(!text.is_empty());
     }
 
     // welcome
@@ -452,22 +517,17 @@ impl Wizard {
             move || backend.preflight(),
             move |checks| {
                 let Some(wizard) = weak.upgrade() else { return };
-                while let Some(child) = wizard.widgets.checks.first_child() {
-                    wizard.widgets.checks.remove(&child);
-                }
+                let list = &wizard.widgets.checks;
+                clear(list);
                 let mut blocked = false;
                 for check in &checks {
                     let ok = check.severity == Severity::Ok;
                     blocked |= check.severity == Severity::Missing;
-                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-                    row.append(&status_icon(ok));
-                    let text = match &check.fix {
-                        Some(fix) => format!("{} — {fix}", check.message),
-                        None => check.message.clone(),
-                    };
-                    row.append(&label(&text, &[]));
-                    wizard.widgets.checks.append(&row);
+                    let line = row(&check.message, check.fix.as_deref().unwrap_or_default());
+                    line.add_prefix(&status_icon(ok));
+                    list.append(&line);
                 }
+                list.set_visible(!checks.is_empty());
                 wizard.widgets.welcome_next.set_sensitive(!blocked);
             },
         );
@@ -528,7 +588,7 @@ impl Wizard {
         let w = &self.widgets;
         Self::show_note(&w.account_message, "");
         w.sign_in.set_sensitive(false);
-        w.account_busy.show("Sign in on icloud.com in the browser window, and choose “Trust” when Apple asks…");
+        w.account_busy.show("Waiting for you to sign in in the browser window…");
 
         let backend = Arc::clone(&self.backend);
         let weak = Rc::downgrade(self);
@@ -536,49 +596,33 @@ impl Wizard {
             move || backend.sign_in_with_browser(),
             move |result| {
                 let Some(wizard) = weak.upgrade() else { return };
+                let w = &wizard.widgets;
+                w.account_busy.hide();
+                w.sign_in.set_sensitive(true);
                 match result {
                     Ok(info) => {
                         *wizard.account.borrow_mut() = Some(info);
-                        wizard.widgets.account_busy.hide();
                         wizard.go("install");
                     }
-                    Err(err) => wizard.account_failed(&err.to_string()),
+                    Err(err) => Self::show_error(&w.account_message, &err.to_string()),
                 }
             },
         );
     }
 
-    fn account_failed(&self, message: &str) {
-        let w = &self.widgets;
-        w.account_busy.hide();
-        w.sign_in.set_sensitive(true);
-        Self::show_error(&w.account_message, message);
-    }
-
     // install
     fn add_step(&self, title: &str, outcome: &Result<String, String>) {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        row.add_css_class("step-row");
-        let ok = outcome.is_ok();
-        row.append(&status_icon(ok));
-        let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        text.append(&label(title, &["heading"]));
         let (Ok(detail) | Err(detail)) = outcome;
-        let detail = detail.as_str();
-        if !detail.is_empty() {
-            text.append(&label(detail, &[if ok { "note-text" } else { "error-text" }]));
-        }
-        row.append(&text);
-        self.widgets.steps.append(&row);
+        let line = row(title, detail);
+        line.add_prefix(&status_icon(outcome.is_ok()));
+        self.widgets.steps.append(&line);
     }
 
     fn begin_install(self: &Rc<Self>) {
         let w = &self.widgets;
-        while let Some(child) = w.steps.first_child() {
-            w.steps.remove(&child);
-        }
+        clear(&w.steps);
         let mount = self.plan.borrow().mount_dir.display().to_string();
-        self.add_step("Prepare the folder and the service", &Ok(mount.clone()));
+        self.add_step("Prepare the folder and the service", &Ok(mount));
         let who =
             self.account.borrow().as_ref().and_then(|a| a.apple_id.clone()).unwrap_or_else(|| "your account".into());
         self.add_step("Sign in to iCloud", &Ok(format!("{who}, no password stored")));
@@ -604,13 +648,13 @@ impl Wizard {
 
     fn finish_page(&self, outcomes: &[StepOutcome]) {
         let w = &self.widgets;
-        let all_ok = outcomes.iter().all(StepOutcome::is_ok);
         let mount = self.plan.borrow().mount_dir.display().to_string();
-        if all_ok {
-            w.done_title.set_label("iCloud Drive is ready");
+        if outcomes.iter().all(StepOutcome::is_ok) {
+            w.done.set_icon_name(Some("emblem-ok-symbolic"));
+            w.done.set_title("iCloud Drive Is Ready");
             let mut body = format!(
                 "Your files are in {mount}. Folders load as you open them; a file downloads when you open it or \
-                 choose \"Download from iCloud\" in its right-click menu. Changes you make there are uploaded \
+                 choose “Download from iCloud” in its right-click menu. Changes you make there are uploaded \
                  automatically."
             );
             if self.plan.borrow().show_sidebar_status {
@@ -621,14 +665,16 @@ impl Wizard {
                     "\n\nRight-click a file or folder in iCloud Drive, then Scripts, to keep it on this computer.",
                 );
             }
-            w.done_body.set_label(&body);
+            // The description is markup; the folder name must not be read as such.
+            w.done.set_description(Some(&glib::markup_escape_text(&body)));
             w.open_folder.set_sensitive(true);
         } else {
-            w.done_title.set_label("Almost there");
-            w.done_body.set_label(
-                "Something did not finish. Run `icloudctl doctor` to see what is wrong and how to fix it, or `icloudctl logs` for details. \
-                 Your sign-in was saved, so you will not have to repeat it.",
-            );
+            w.done.set_icon_name(Some("dialog-warning-symbolic"));
+            w.done.set_title("Almost There");
+            w.done.set_description(Some(
+                "Something did not finish. Run <tt>icloudctl doctor</tt> to see what is wrong and how to fix it, \
+                 or <tt>icloudctl logs</tt> for details. Your sign-in was saved, so you will not have to repeat it.",
+            ));
             w.open_folder.set_sensitive(false);
         }
     }
@@ -692,19 +738,17 @@ fn wire(wizard: &Rc<Wizard>) {
     on("open-folder", Box::new(|w| w.open_folder()), weak(wizard));
     on("close", Box::new(|w| w.window.close()), weak(wizard));
 
-    // Enter submits the current page.
-    let submit = |w: Weak<Wizard>, action: fn(&Rc<Wizard>)| {
-        move |_: &gtk::Entry| {
-            if let Some(w) = w.upgrade() {
-                action(&w);
-            }
+    // Enter in the folder field continues.
+    let w = weak(wizard);
+    wizard.widgets.folder_entry.connect_entry_activated(move |_| {
+        if let Some(w) = w.upgrade() {
+            w.continue_from_folder();
         }
-    };
-    wizard.widgets.folder_entry.connect_activate(submit(weak(wizard), Wizard::continue_from_folder));
+    });
 }
 
-/// Demo only: click through the whole wizard, so the
-/// flow can be watched (or screenshotted) without a person.
+/// Demo only: click through the whole wizard, so the flow can be watched (or
+/// screenshotted) without a person.
 fn autoplay(wizard: &Rc<Wizard>) {
     type Step = Box<dyn Fn(&Rc<Wizard>)>;
     let click = |name: &'static str| -> Step {

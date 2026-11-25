@@ -1,6 +1,6 @@
 [package]
 name = "icloud-installer"
-description = "GTK4 guided installer for icloud-linux"
+description = "GTK4/libadwaita guided installer for icloud-linux"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,7 @@ workspace = true
 gtk4 = "0.11.4"
 icloud-api = { version = "0.2.0", path = "../icloud-api" }
 icloud-core = { version = "0.2.0", path = "../icloud-core" }
+libadwaita = { version = "0.9.2", features = ["v1_2"] }
 secrecy = "0.10.3"
 serde_json = "1.0.151"
 tracing = "0.1.44"
