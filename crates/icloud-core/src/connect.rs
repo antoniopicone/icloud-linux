@@ -2,17 +2,16 @@
 
 use std::sync::Arc;
 
-use icloud_api::{Client, ClientConfig, Drive, Endpoints, LoginStatus};
+use icloud_api::{Client, ClientConfig, Drive, Endpoints, HttpDrive, RenewingDrive};
 
-use crate::{
-    config::Config,
-    error::{Error, Result},
-};
+use crate::{config::Config, error::Result};
 
 /// Outcome of trying to reach iCloud at startup.
 pub enum Connection {
     Ready {
         drive: Arc<dyn Drive>,
+        /// The same drive, for renewing the session before it lapses.
+        session: Arc<RenewingDrive<HttpDrive>>,
         /// Kept so its session can be saved on shutdown.
         client: Arc<Client>,
     },
@@ -48,11 +47,11 @@ pub fn client_for(config: &Config) -> Result<Client> {
     Ok(Client::new(client_config)?)
 }
 
-/// Reuse the saved session, and if that fails try the stored password once.
+/// Reuse the saved session from the last sign-in on icloud.com.
 ///
-/// At most one password proof is sent. A network failure is returned as an
-/// error (the caller may retry later, which costs nothing); a session that
-/// needs the user comes back as [`Connection::Unauthenticated`].
+/// A network failure is returned as an error (the caller may retry later,
+/// which costs nothing); a session Apple no longer accepts comes back as
+/// [`Connection::Unauthenticated`]: only signing in again helps.
 pub fn connect(config: &Config) -> Result<Connection> {
     let client = client_for(config)?;
 
@@ -61,30 +60,21 @@ pub fn connect(config: &Config) -> Result<Connection> {
             return Err(err.into());
         }
         tracing::info!("the saved session cannot be reused ({err})");
-        let Some(password) = &config.password else {
-            return Ok(Connection::Unauthenticated { reason: err.to_string() });
-        };
-        tracing::info!("signing in with the stored password");
-        match client.login(password) {
-            Ok(LoginStatus::Authenticated) => {}
-            Ok(LoginStatus::TwoFactorRequired) => {
-                return Ok(Connection::Unauthenticated {
-                    reason: "a verification code is needed; run `icloudctl auth`".into(),
-                });
-            }
-            Err(err) if err.is_auth() => return Ok(Connection::Unauthenticated { reason: err.to_string() }),
-            Err(err) => return Err(err.into()),
-        }
+        return Ok(Connection::Unauthenticated { reason: err.to_string() });
     }
 
-    let drive: Arc<dyn Drive> = Arc::new(client.drive().map_err(Error::from)?);
-    Ok(Connection::Ready { drive, client: Arc::new(client) })
+    // The web session lapses while the daemon runs; renew it when Drive says so.
+    let client = Arc::new(client);
+    let renewer = Arc::clone(&client);
+    let session = Arc::new(RenewingDrive::new(client.drive()?, move || renewer.renew_session()));
+    let drive: Arc<dyn Drive> = session.clone();
+    Ok(Connection::Ready { drive, session, client })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dirs::Layout;
+    use crate::{dirs::Layout, error::Error};
 
     #[test]
     fn a_config_without_an_apple_id_cannot_connect() {
@@ -94,7 +84,7 @@ mod tests {
     }
 
     #[test]
-    fn without_a_saved_session_or_password_the_daemon_parks_unauthenticated_and_never_touches_the_network() {
+    fn without_a_saved_session_the_daemon_parks_unauthenticated_and_never_touches_the_network() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::for_layout(&Layout::under(dir.path()));
         config.username = "me@example.com".into();

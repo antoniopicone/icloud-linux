@@ -12,6 +12,7 @@ use fuser::{Config as MountConfig, MountOption, Session, SessionACL};
 use icloud_core::{
     Config, Engine, EngineConfig, FsCore, FsOptions, Layout, Mirror, SyncPolicy, SyncState,
     connect::{Connection, connect},
+    notify::{DesktopNotifier, FailureReporter},
     setup::cleanup_mountpoint,
 };
 use signal_hook::{
@@ -24,7 +25,10 @@ use crate::adapter::IcloudFs;
 /// Threads serving kernel requests. Several are needed so that one request
 /// blocked on a large download does not freeze every other one.
 const FUSE_THREADS: usize = 16;
-const SESSION_FLUSH_INTERVAL: Duration = Duration::from_secs(600);
+/// How often the web session is renewed. icloud.com does it every few minutes
+/// from an open tab; a session left alone lapses within about half an hour,
+/// and the next file opened would wait for it to be renewed first.
+const SESSION_RENEW_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -49,29 +53,32 @@ pub fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(SyncState::open(&config.state_db())?);
     let policy = SyncPolicy::new(&config.sync_paths, &config.exclude_paths);
 
-    let (engine, client) = match connect(&config)? {
-        Connection::Ready { drive, client } => {
+    let (engine, client, icloud_session) = match connect(&config)? {
+        Connection::Ready { drive, session: icloud_session, client } => {
             let engine =
                 Engine::new(drive, mirror.clone(), state.clone(), policy.clone(), EngineConfig::from_config(&config));
             engine.start()?;
-            (Some(engine), Some(client))
+            (Some(engine), Some(client), Some(icloud_session))
         }
         Connection::Unauthenticated { reason } => {
             tracing::error!(
                 "starting UNAUTHENTICATED: {reason}. The cache is served read-only. \
-                 Run `icloudctl auth`, then `icloudctl restart`."
+                 Run `icloudctl auth` to sign in again."
             );
-            (None, None)
+            (None, None, None)
         }
     };
 
-    let core = Arc::new(FsCore::new(
-        mirror,
-        state,
-        policy,
-        engine.clone(),
-        FsOptions { read_only: config.fuse_options.ro, preview_max_bytes: config.preview_max_bytes },
-    ));
+    let core = Arc::new(
+        FsCore::new(
+            mirror,
+            state,
+            policy,
+            engine.clone(),
+            FsOptions { read_only: config.fuse_options.ro, preview_max_bytes: config.preview_max_bytes },
+        )
+        .with_failure_reporter(FailureReporter::new(DesktopNotifier::default())),
+    );
     let filesystem = IcloudFs::new(core);
 
     cleanup_mountpoint(&options.mountpoint)?;
@@ -99,13 +106,13 @@ pub fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    // Keep the session file fresh: Apple rotates tokens while the daemon runs.
-    if let Some(client) = client.clone() {
+    // Keep the web session alive, and its file fresh: each renewal is saved.
+    if let Some(icloud_session) = icloud_session {
         thread::Builder::new().name("icloud-session".into()).spawn(move || {
             loop {
-                thread::sleep(SESSION_FLUSH_INTERVAL);
-                if let Err(err) = client.session().flush() {
-                    tracing::warn!("could not save the iCloud session: {err}");
+                thread::sleep(SESSION_RENEW_INTERVAL);
+                if let Err(err) = icloud_session.renew_now() {
+                    tracing::warn!("could not renew the iCloud session: {err}");
                 }
             }
         })?;

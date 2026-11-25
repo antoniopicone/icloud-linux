@@ -1,9 +1,10 @@
 //! Blocking client for the parts of iCloud that `icloud-linux` needs.
 //!
-//! * [`srp`]: Apple's flavour of SRP-6a and the password stretching it needs.
-//! * [`Session`]: cookies, Apple's session headers, error normalisation.
-//! * [`Client`]: sign in, two-factor, trust, and hand out services.
+//! * [`Session`]: cookies, persistence, error normalisation.
+//! * [`Client`]: take over a sign-in made on icloud.com, keep it alive, and
+//!   hand out services. No password ever passes through this crate.
 //! * [`drive`]: the [`Drive`] trait and its HTTP implementation.
+//! * [`RenewingDrive`]: renews a lapsed web session and repeats the request.
 //!
 //! Notes, Photos and the like would arrive as further service modules next to
 //! `drive`, obtained from the same [`Client`].
@@ -11,18 +12,17 @@
 pub mod client;
 pub mod drive;
 pub mod error;
+pub mod renew;
 pub mod session;
-pub mod srp;
-pub mod twofactor;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod memory;
 
-pub use client::{AccountInfo, Client, ClientConfig, Endpoints, LoginStatus};
+pub use client::{AccountInfo, Client, ClientConfig, Endpoints};
 pub use drive::{DeleteMode, Drive, HttpDrive, Node, NodeKind};
 pub use error::{Error, Result};
+pub use renew::RenewingDrive;
 pub use session::{BrowserCookie, Session};
-pub use twofactor::{CodeMethod, TrustedPhone, TwoFactorOptions};
 
 /// A random (version 4) UUID in its canonical lower-case form.
 pub(crate) fn uuid_v4() -> Result<String> {

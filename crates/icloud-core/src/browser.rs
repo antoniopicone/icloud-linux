@@ -1,4 +1,5 @@
-//! Sign-in through a browser (`icloudctl auth --from-browser`, the installer):
+//! Sign-in through a browser (`icloudctl auth`, the installer, the
+//! notification of an expired session):
 //! the person signs in on icloud.com in a real browser window.
 //!
 //! The Apple ID, the password and the verification code are typed into
@@ -111,8 +112,7 @@ impl BrowserSignIn {
 /// have Apple confirm the session, then save it and the Apple ID it belongs
 /// to in the configuration under `layout` (which must exist: `init` first).
 ///
-/// `opened` is called once the window is up, before the long wait. Any stored
-/// password is dropped: it would belong to a sign-in this one replaces.
+/// `opened` is called once the window is up, before the long wait.
 pub fn sign_in_and_save(layout: &Layout, opened: &mut dyn FnMut()) -> Result<AccountInfo> {
     let config = Config::load(&layout.config_file(), layout)?;
     let path = require_browser()?;
@@ -142,7 +142,7 @@ pub fn sign_in_and_save(layout: &Layout, opened: &mut dyn FnMut()) -> Result<Acc
             Error::Setup(tr("Apple accepted the sign-in but did not say which Apple ID it is").into())
         })?;
     client.session().save_as(&apple_id, &config.cookie_dir)?;
-    setup::configure(layout, &apple_id, None)?;
+    setup::configure(layout, &apple_id)?;
     Ok(info)
 }
 

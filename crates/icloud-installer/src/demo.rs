@@ -1,66 +1,18 @@
 //! A pretend system, for `--demo`: try the whole wizard without an Apple
 //! account and without changing anything on the machine.
 
-use std::{collections::VecDeque, path::Path, thread, time::Duration};
+use std::{path::Path, thread, time::Duration};
 
-use icloud_api::{AccountInfo, Error as ApiError, LoginStatus, TrustedPhone, TwoFactorOptions};
+use icloud_api::AccountInfo;
 use icloud_core::{
     Result,
     i18n::{tr, trf},
-    installer::{Authenticator, Backend, InstallPlan, Prepared, StepOutcome},
+    installer::{Backend, InstallPlan, Prepared, StepOutcome},
     setup::{Check, Severity},
 };
-use secrecy::{ExposeSecret, SecretString};
-use serde_json::json;
-
-/// The code the demo accepts.
-pub(crate) const DEMO_CODE: &str = "123456";
 
 #[derive(Debug, Default)]
 pub(crate) struct DemoBackend;
-
-struct DemoAuth {
-    options: TwoFactorOptions,
-    pending: VecDeque<()>,
-}
-
-impl Authenticator for DemoAuth {
-    fn login(&mut self, password: &SecretString) -> icloud_api::Result<LoginStatus> {
-        thread::sleep(Duration::from_millis(900));
-        match password.expose_secret() {
-            "wrong" => Err(ApiError::LoginFailed("Invalid email/password combination.".into())),
-            "trusted" => Ok(LoginStatus::Authenticated),
-            _ => Ok(LoginStatus::TwoFactorRequired),
-        }
-    }
-
-    fn options(&self) -> TwoFactorOptions {
-        self.options.clone()
-    }
-
-    fn send_sms(&mut self, _: &TrustedPhone) -> icloud_api::Result<()> {
-        thread::sleep(Duration::from_millis(500));
-        self.pending.push_back(());
-        Ok(())
-    }
-
-    fn verify_sms(&mut self, _: &TrustedPhone, code: &str) -> icloud_api::Result<()> {
-        self.verify_trusted_device(code)
-    }
-
-    fn verify_trusted_device(&mut self, code: &str) -> icloud_api::Result<()> {
-        thread::sleep(Duration::from_millis(600));
-        if code.chars().filter(char::is_ascii_digit).collect::<String>() == DEMO_CODE {
-            Ok(())
-        } else {
-            Err(ApiError::WrongCode)
-        }
-    }
-
-    fn account(&self) -> AccountInfo {
-        AccountInfo { apple_id: Some("demo@icloud.com".into()), full_name: Some("Demo User".into()) }
-    }
-}
 
 impl Backend for DemoBackend {
     fn preflight(&self) -> Vec<Check> {
@@ -76,35 +28,10 @@ impl Backend for DemoBackend {
         Ok(Prepared { mount_dir: plan.mount_dir.clone(), used_fallback: false })
     }
 
-    fn save_account(&self, _: &str, _: Option<SecretString>) -> Result<()> {
-        Ok(())
-    }
-
     fn sign_in_with_browser(&self) -> Result<AccountInfo> {
         // Long enough to see the waiting message.
         thread::sleep(Duration::from_millis(2500));
         Ok(AccountInfo { apple_id: Some("demo@icloud.com".into()), full_name: Some("Demo User".into()) })
-    }
-
-    fn authenticator(&self) -> Result<Box<dyn Authenticator>> {
-        let phones = vec![
-            TrustedPhone {
-                id: json!(1),
-                non_fteu: Some(true),
-                push_mode: Some("sms".into()),
-                display: Some("+39 ••• ••• ••12".into()),
-            },
-            TrustedPhone {
-                id: json!(2),
-                non_fteu: None,
-                push_mode: Some("sms".into()),
-                display: Some("+1 ••• ••• ••99".into()),
-            },
-        ];
-        Ok(Box::new(DemoAuth {
-            options: TwoFactorOptions { has_trusted_devices: true, phones, ..TwoFactorOptions::default() },
-            pending: VecDeque::new(),
-        }))
     }
 
     fn finish(&self, plan: &InstallPlan, mount_dir: &Path) -> Vec<StepOutcome> {

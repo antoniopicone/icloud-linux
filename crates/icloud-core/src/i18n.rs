@@ -256,6 +256,22 @@ const ITALIAN: &[(&str, &str)] = &[
     ("could not talk to the browser: {}", "impossibile comunicare con il browser: {}"),
     ("the browser was closed before the sign-in finished", "il browser è stato chiuso prima della fine dell'accesso"),
     ("timed out waiting for the sign-in in the browser", "tempo scaduto in attesa dell'accesso nel browser"),
+    // daemon: a file that was opened but could not be downloaded
+    ("Could not open “{}”", "Impossibile aprire «{}»"),
+    (
+        "The iCloud session has expired, so the file cannot be downloaded. Click to sign in again on icloud.com.",
+        "La sessione di iCloud è scaduta, quindi il file non può essere scaricato. Fai clic per accedere di nuovo su icloud.com.",
+    ),
+    (
+        "iCloud could not be reached. Check the connection, then open the file again.",
+        "Impossibile raggiungere iCloud. Controlla la connessione, poi apri di nuovo il file.",
+    ),
+    ("Sign in on icloud.com", "Accedi su icloud.com"),
+    // icloudctl auth --notify, after a click on that notification
+    ("Signed in to iCloud", "Accesso a iCloud eseguito"),
+    ("Signed in as {}. Open the file again.", "Accesso eseguito come {}. Apri di nuovo il file."),
+    ("Open the file again.", "Apri di nuovo il file."),
+    ("iCloud sign-in failed", "Accesso a iCloud non riuscito"),
 ];
 
 #[cfg(test)]
@@ -343,6 +359,8 @@ mod tests {
         let files = [
             "icloud-core/src/installer/mod.rs",
             "icloud-core/src/browser.rs",
+            "icloud-core/src/notify.rs",
+            "icloudctl/src/commands.rs",
             "icloud-installer/src/wizard.rs",
             "icloud-installer/src/main.rs",
             "icloud-installer/src/demo.rs",

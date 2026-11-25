@@ -6,8 +6,6 @@ use std::io::{self, BufRead, Write};
 pub trait Prompter {
     /// Show `text` and read a line.
     fn line(&mut self, text: &str) -> io::Result<String>;
-    /// Show `text` and read a line without echoing it.
-    fn secret(&mut self, text: &str) -> io::Result<String>;
     fn say(&mut self, text: &str);
 }
 
@@ -24,10 +22,6 @@ impl Prompter for Terminal {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no input available"));
         }
         Ok(line.trim().to_owned())
-    }
-
-    fn secret(&mut self, text: &str) -> io::Result<String> {
-        rpassword::prompt_password(text)
     }
 
     fn say(&mut self, text: &str) {
@@ -72,9 +66,6 @@ pub(crate) mod testing {
 
     impl Prompter for Script {
         fn line(&mut self, text: &str) -> io::Result<String> {
-            self.next(text)
-        }
-        fn secret(&mut self, text: &str) -> io::Result<String> {
             self.next(text)
         }
         fn say(&mut self, text: &str) {

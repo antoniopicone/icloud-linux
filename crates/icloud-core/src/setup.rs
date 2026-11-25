@@ -1,6 +1,6 @@
 //! Installing, configuring and controlling the service.
 //!
-//! Everything the `icloudctl` commands `init`, `configure`, `start`, `stop`,
+//! Everything the `icloudctl` commands `init`, `auth`, `start`, `stop`,
 //! `doctor`… do lives here, so the command line tool and the GTK installer
 //! share one implementation. Nothing here spawns a shell: external programs
 //! (`systemctl`, `fusermount3`) are run with explicit argument lists.
@@ -11,8 +11,6 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-
-use secrecy::SecretString;
 
 use crate::{
     config::{Config, write_private_file},
@@ -296,13 +294,9 @@ fn is_writable(dir: &Path) -> bool {
 
 // ---- configure ---------------------------------------------------------------------------------
 
-/// Record the Apple ID (and optionally the password) in `config.yaml`,
-/// keeping every other setting already there.
-///
-/// Storing the password is optional and off by default: with it the daemon
-/// can renew an expired session unattended, without it an expired session
-/// needs `icloudctl auth` again. It is written with mode 0600.
-pub fn configure(layout: &Layout, username: &str, password: Option<SecretString>) -> Result<Config> {
+/// Record the Apple ID a sign-in belongs to in `config.yaml`, keeping every
+/// other setting already there. The file is written with mode 0600.
+pub fn configure(layout: &Layout, username: &str) -> Result<Config> {
     let username = username.trim();
     if username.is_empty() || username.contains(char::is_whitespace) {
         return Err(Error::Config("the Apple ID must be an email address or phone number".into()));
@@ -311,7 +305,6 @@ pub fn configure(layout: &Layout, username: &str, password: Option<SecretString>
     let path = layout.config_file();
     let mut config = if path.exists() { Config::load(&path, layout)? } else { Config::for_layout(layout) };
     config.username = username.to_owned();
-    config.password = password;
     config.save(&path)?;
     Ok(config)
 }
@@ -615,11 +608,13 @@ pub fn doctor(layout: &Layout, sys: &dyn Systemctl) -> Vec<Check> {
                             .with_fix(format!("chmod 600 {}", config_path.display())),
                     );
                 }
-                if config.password.is_some() {
-                    checks.push(Check::new(
-                        Severity::Info,
-                        "the password is stored in config.yaml (0600); remove the `password` line to stop storing it",
-                    ));
+                if fs::read_to_string(&config_path)
+                    .is_ok_and(|text| text.lines().any(|line| line.trim_start().starts_with("password:")))
+                {
+                    checks.push(
+                        Check::new(Severity::Warn, "config.yaml still holds a password, which is no longer used")
+                            .with_fix(format!("delete the `password` line from {}", config_path.display())),
+                    );
                 }
                 Some(config)
             }
@@ -732,7 +727,6 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::ExposeSecret;
 
     use super::{testing::FakeSystemctl, *};
 
@@ -859,7 +853,7 @@ mod tests {
     #[test]
     fn init_keeps_an_existing_configuration() {
         let (_d, layout, sys) = setup();
-        configure(&layout, "me@example.com", None).unwrap();
+        configure(&layout, "me@example.com").unwrap();
         let report = init(&layout, &layout.home.join("iCloud"), Path::new("/d"), &sys).unwrap();
         assert!(!report.config_created);
         assert_eq!(Config::load(&layout.config_file(), &layout).unwrap().username, "me@example.com");
@@ -888,23 +882,10 @@ mod tests {
     #[test]
     fn configure_stores_the_apple_id_without_a_password_by_default() {
         let (_d, layout, _) = setup();
-        configure(&layout, "  me@example.com ", None).unwrap();
+        configure(&layout, "  me@example.com ").unwrap();
         let text = fs::read_to_string(layout.config_file()).unwrap();
         assert!(text.contains("me@example.com") && !text.contains("password"));
         assert_eq!(fs::metadata(layout.config_file()).unwrap().permissions().mode() & 0o777, 0o600);
-    }
-
-    #[test]
-    fn configure_can_store_a_password_when_asked_and_replaces_it_later() {
-        let (_d, layout, _) = setup();
-        configure(&layout, "me@example.com", Some(SecretString::from("pw1".to_owned()))).unwrap();
-        let loaded = Config::load(&layout.config_file(), &layout).unwrap();
-        assert_eq!(loaded.password.as_ref().map(ExposeSecret::expose_secret), Some("pw1"));
-        configure(&layout, "me@example.com", None).unwrap();
-        assert!(
-            Config::load(&layout.config_file(), &layout).unwrap().password.is_none(),
-            "declining removes a stored password"
-        );
     }
 
     #[test]
@@ -912,7 +893,7 @@ mod tests {
         let (_d, layout, _) = setup();
         fs::create_dir_all(&layout.config_dir).unwrap();
         fs::write(layout.config_file(), "sync_paths: [/Downloads]\ncrawl_mode: full\nusername: old@x.com\n").unwrap();
-        configure(&layout, "new@x.com", None).unwrap();
+        configure(&layout, "new@x.com").unwrap();
         let loaded = Config::load(&layout.config_file(), &layout).unwrap();
         assert_eq!(loaded.username, "new@x.com");
         assert_eq!(loaded.sync_paths, ["/Downloads"]);
@@ -923,7 +904,7 @@ mod tests {
     fn configure_rejects_an_unusable_apple_id() {
         let (_d, layout, _) = setup();
         for bad in ["", "   ", "two words@x.com"] {
-            assert!(configure(&layout, bad, None).is_err(), "{bad:?}");
+            assert!(configure(&layout, bad).is_err(), "{bad:?}");
         }
     }
 
@@ -1146,14 +1127,16 @@ mod tests {
     }
 
     #[test]
-    fn doctor_warns_about_a_world_readable_config_and_a_stored_password() {
+    fn doctor_warns_about_a_world_readable_config_and_a_leftover_password() {
         let (_d, layout, sys) = setup();
         init(&layout, &layout.home.join("iCloud"), Path::new("/d"), &sys).unwrap();
-        configure(&layout, "me@example.com", Some(SecretString::from("pw".to_owned()))).unwrap();
+        configure(&layout, "me@example.com").unwrap();
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        fs::write(layout.config_file(), format!("{text}password: old\n")).unwrap();
         fs::set_permissions(layout.config_file(), fs::Permissions::from_mode(0o644)).unwrap();
         let checks = doctor(&layout, &sys);
         assert!(has(&checks, Severity::Warn, "readable by other users"));
-        assert!(has(&checks, Severity::Info, "password is stored"));
+        assert!(has(&checks, Severity::Warn, "still holds a password"));
     }
 
     #[test]

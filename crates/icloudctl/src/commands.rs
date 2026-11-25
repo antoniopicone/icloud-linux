@@ -8,12 +8,14 @@ use std::{
 };
 
 use icloud_core::{
-    Config, Error, Layout, Result, browser, connect::client_for, hydrate, setup, setup::Systemctl, sync_request,
+    Config, Error, Layout, Result, browser, hydrate,
+    i18n::{tr, trf},
+    setup,
+    setup::Systemctl,
+    sync_request,
 };
-use secrecy::SecretString;
 
 use crate::{
-    auth::{self, AuthOptions},
     cli::Command,
     prompt::{Prompter, confirm},
 };
@@ -29,7 +31,7 @@ fn load_config(ctx: &Context<'_>) -> Result<Config> {
     let path = ctx.layout.config_file();
     if !path.exists() {
         return Err(Error::Config(format!(
-            "{} not found: run `icloudctl init` and `icloudctl configure`",
+            "{} not found: run `icloudctl init`, then `icloudctl auth`",
             path.display()
         )));
     }
@@ -40,13 +42,7 @@ pub fn run(command: Command, ctx: &mut Context<'_>) -> Result<()> {
     match command {
         Command::Quickstart { mount_dir } => quickstart(ctx, mount_dir),
         Command::Init { mount_dir } => init(ctx, mount_dir),
-        Command::Configure { email, store_password } => configure(ctx, email, store_password),
-        Command::Auth { force_sms, trust_token, from_browser, debug } => {
-            if from_browser {
-                return authenticate_in_browser(ctx);
-            }
-            authenticate(ctx, &AuthOptions { force_sms, trust_token, debug })
-        }
+        Command::Auth { notify } => authenticate(ctx, notify),
         Command::Start => {
             setup::start(&ctx.layout, ctx.sys)?;
             ctx.ui.say(&setup::status_text(ctx.sys));
@@ -128,35 +124,34 @@ fn init(ctx: &mut Context<'_>, mount_dir: Option<PathBuf>) -> Result<()> {
     ctx.ui.say(&format!("- Config:  {}", ctx.layout.config_file().display()));
     ctx.ui.say(&format!("- Mount:   {}", report.mount_dir.display()));
     ctx.ui.say(&format!("- Service: {}", report.service_file.display()));
-    ctx.ui.say("Next: icloudctl configure, then icloudctl auth");
+    ctx.ui.say("Next: icloudctl auth, to sign in on icloud.com");
     Ok(())
 }
 
-fn configure(ctx: &mut Context<'_>, email: Option<String>, store_password: bool) -> Result<()> {
-    let email = match email {
-        Some(email) => email,
-        None => ctx.ui.line("Apple ID: ")?,
-    };
-    let password = if store_password {
-        ctx.ui.say("The password will be saved in config.yaml (mode 0600).");
-        Some(SecretString::from(ctx.ui.secret("Apple ID password (input hidden): ")?))
-    } else {
-        None
-    };
-    setup::configure(&ctx.layout, &email, password)?;
-    ctx.ui.say(&format!("Saved {}", ctx.layout.config_file().display()));
-    if !store_password {
-        ctx.ui.say("The password is not stored; you will be asked for it when you sign in.");
+/// `icloudctl auth`: sign in on icloud.com, then restart the service if it
+/// runs, so that it picks up the new session.
+fn authenticate(ctx: &mut Context<'_>, notify_user: bool) -> Result<()> {
+    let outcome = sign_in(ctx);
+    match &outcome {
+        Ok(apple_id) => notify(
+            notify_user,
+            tr("Signed in to iCloud"),
+            &match apple_id {
+                Some(id) => trf("Signed in as {}. Open the file again.", &[id]),
+                None => tr("Open the file again.").to_owned(),
+            },
+        ),
+        Err(err) => notify(notify_user, tr("iCloud sign-in failed"), &err.to_string()),
     }
-    Ok(())
+    outcome.map(drop)
 }
 
-fn authenticate_in_browser(ctx: &mut Context<'_>) -> Result<()> {
+fn sign_in(ctx: &mut Context<'_>) -> Result<Option<String>> {
     load_config(ctx)?; // says to run `init` first when there is none
     ctx.ui.say("Opening a browser with a temporary profile…");
     let ui = &mut *ctx.ui;
     let info = browser::sign_in_and_save(&ctx.layout, &mut || {
-        ui.say("Sign in to iCloud in the window that opened, and answer \"Trust this browser\" when Apple asks.");
+        ui.say("Sign in to iCloud in the window that opened.");
         ui.say("Waiting for the sign-in to finish…");
     })?;
     ctx.ui.say("AUTH_OK");
@@ -164,23 +159,17 @@ fn authenticate_in_browser(ctx: &mut Context<'_>) -> Result<()> {
         ctx.ui.say(&format!("Authenticated as: {id}"));
     }
     ctx.ui.say("The session is saved; no password is stored.");
-    Ok(())
-}
-
-fn authenticate(ctx: &mut Context<'_>, options: &AuthOptions) -> Result<()> {
-    let config = load_config(ctx)?;
-    let client = client_for(&config)?;
-    auth::run(&client, &config, options, ctx.ui)?;
-    ctx.ui.say(&format!("Session saved under {}", config.cookie_dir.display()));
-    Ok(())
+    if setup::is_active(ctx.sys) {
+        setup::restart(&ctx.layout, ctx.sys)?;
+        ctx.ui.say("Restarted the service with the new session.");
+    }
+    Ok(info.apple_id)
 }
 
 fn quickstart(ctx: &mut Context<'_>, mount_dir: Option<PathBuf>) -> Result<()> {
     init(ctx, mount_dir)?;
-    ctx.ui.say("\nNow your Apple ID:");
-    configure(ctx, None, false)?;
-    ctx.ui.say("\nSigning in:");
-    authenticate(ctx, &AuthOptions::default())?;
+    ctx.ui.say("\nSigning in on icloud.com:");
+    sign_in(ctx)?;
     ctx.ui.say("\nStarting the service…");
     setup::start(&ctx.layout, ctx.sys)?;
     ctx.ui.say(&setup::status_text(ctx.sys));
@@ -535,33 +524,6 @@ mod tests {
     fn durations_switch_to_minutes_after_two() {
         assert_eq!(format_duration(Duration::from_secs(90)), "90s");
         assert_eq!(format_duration(Duration::from_secs(125)), "2m 5s");
-    }
-
-    #[test]
-    fn configure_without_the_flag_never_asks_for_a_password_and_never_stores_one() {
-        let (dir, sys) = ctx_parts();
-        let mut ui = Script::new(&["me@example.com"]);
-        run_command(&dir, &sys, &mut ui, Command::Configure { email: None, store_password: false }).unwrap();
-        assert_eq!(ui.asked, ["Apple ID: "], "the password must not even be requested");
-        let saved = fs::read_to_string(Layout::under(dir.path()).config_file()).unwrap();
-        assert!(saved.contains("me@example.com") && !saved.contains("password"));
-        assert!(ui.said_contains("not stored"));
-    }
-
-    #[test]
-    fn configure_with_the_flag_stores_the_password() {
-        let (dir, sys) = ctx_parts();
-        let mut ui = Script::new(&["hunter2"]);
-        run_command(
-            &dir,
-            &sys,
-            &mut ui,
-            Command::Configure { email: Some("me@example.com".into()), store_password: true },
-        )
-        .unwrap();
-        let saved = fs::read_to_string(Layout::under(dir.path()).config_file()).unwrap();
-        assert!(saved.contains("hunter2"));
-        assert!(ui.said_contains("0600"));
     }
 
     #[test]

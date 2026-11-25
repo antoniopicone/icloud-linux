@@ -3,7 +3,8 @@
 //! The file format is the one the Python implementation used, so existing
 //! configurations keep working. Two things are stricter on purpose: unknown
 //! values for the mode options are rejected instead of silently replaced by a
-//! default, and the password is optional and never printed.
+//! default. A `password` key left by older versions is ignored: signing in
+//! happens on icloud.com, and no password is ever stored.
 
 use std::{
     fs,
@@ -14,8 +15,7 @@ use std::{
 };
 
 use icloud_api::DeleteMode;
-use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     dirs::Layout,
@@ -76,11 +76,6 @@ impl Default for FuseOptions {
 pub struct Config {
     /// Apple ID.
     pub username: String,
-    /// Optional. With it the daemon can renew an expired session by itself
-    /// (a trusted session needs no code); without it, an expired session means
-    /// running `icloudctl auth` again. Prefer leaving it out.
-    #[serde(with = "secret_option", skip_serializing_if = "Option::is_none")]
-    pub password: Option<SecretString>,
     pub cache_dir: PathBuf,
     pub cookie_dir: PathBuf,
     /// Where to mount, if not given on the command line.
@@ -111,7 +106,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             username: String::new(),
-            password: None,
             cache_dir: PathBuf::from("~/.cache/icloud-linux"),
             cookie_dir: PathBuf::from("~/.config/icloud-linux/cookies"),
             mount_dir: None,
@@ -173,7 +167,7 @@ impl Config {
     /// The user name, or an error saying how to set it.
     pub fn require_username(&self) -> Result<&str> {
         if self.username.trim().is_empty() {
-            Err(Error::Config("no Apple ID configured: run `icloudctl configure`".into()))
+            Err(Error::Config("no Apple ID configured: run `icloudctl auth`".into()))
         } else {
             Ok(self.username.trim())
         }
@@ -221,21 +215,6 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::rename(&tmp, path)
 }
 
-mod secret_option {
-    use super::{Deserialize, Deserializer, ExposeSecret, SecretString, Serializer};
-
-    pub(super) fn serialize<S: Serializer>(value: &Option<SecretString>, s: S) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(secret) => s.serialize_some(secret.expose_secret()),
-            None => s.serialize_none(),
-        }
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<SecretString>, D::Error> {
-        Ok(Option::<String>::deserialize(d)?.filter(|s| !s.is_empty()).map(SecretString::from))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -270,7 +249,6 @@ fuse_options:
 "#;
         let config = Config::parse(yaml, &layout()).unwrap();
         assert_eq!(config.username, "me@example.com");
-        assert_eq!(config.password.as_ref().map(ExposeSecret::expose_secret), Some("secret"));
         assert_eq!(config.cache_dir, PathBuf::from("/home/u/.cache/icloud-linux"));
         assert_eq!(config.crawl_mode, CrawlMode::Lazy, "new option defaults to lazy");
         assert_eq!(config.delete_mode, DeleteMode::Trash);
@@ -283,7 +261,6 @@ fuse_options:
         let config = Config::parse("# nothing\n", &layout()).unwrap();
         assert_eq!(config.upload_interval_seconds, 30);
         assert!(config.auto_sync);
-        assert!(config.password.is_none());
         assert_eq!(config.cache_dir, PathBuf::from("/home/u/.cache/icloud-linux"));
     }
 
@@ -309,15 +286,13 @@ fuse_options:
     }
 
     #[test]
-    fn debug_output_never_contains_the_password() {
-        let config = Config::parse("username: a\npassword: hunter2", &layout()).unwrap();
+    fn a_password_left_by_an_older_version_is_ignored_and_dropped_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::under(dir.path());
+        let config = Config::parse("username: a\npassword: hunter2", &layout).unwrap();
         assert!(!format!("{config:?}").contains("hunter2"));
-    }
-
-    #[test]
-    fn an_empty_password_counts_as_none() {
-        let config = Config::parse("password: ''", &layout()).unwrap();
-        assert!(config.password.is_none());
+        config.save(&layout.config_file()).unwrap();
+        assert!(!fs::read_to_string(layout.config_file()).unwrap().contains("hunter2"));
     }
 
     #[test]
@@ -326,7 +301,6 @@ fuse_options:
         let layout = Layout::under(dir.path());
         let mut config = Config::for_layout(&layout);
         config.username = "me@example.com".into();
-        config.password = Some(SecretString::from("pw".to_owned()));
         config.sync_paths = vec!["/A".into()];
         config.crawl_mode = CrawlMode::Full;
 
@@ -339,18 +313,8 @@ fuse_options:
 
         let loaded = Config::load(&path, &layout).unwrap();
         assert_eq!(loaded.username, "me@example.com");
-        assert_eq!(loaded.password.as_ref().map(ExposeSecret::expose_secret), Some("pw"));
         assert_eq!(loaded.crawl_mode, CrawlMode::Full);
         assert_eq!(loaded.sync_paths, ["/A"]);
-    }
-
-    #[test]
-    fn a_config_without_a_password_does_not_write_the_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::under(dir.path());
-        let path = layout.config_file();
-        Config::for_layout(&layout).save(&path).unwrap();
-        assert!(!fs::read_to_string(path).unwrap().contains("password"));
     }
 
     #[test]

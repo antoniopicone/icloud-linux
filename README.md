@@ -18,10 +18,8 @@ This is a Rust rewrite of the earlier Python implementation. What has and has no
 | | |
 |---|---|
 | Sync engine, cache, FUSE layer | Tested against an in-memory iCloud and through **real kernel FUSE mounts** (`std::fs` calls on a live mount). |
-| Sign-in (SRP), two-factor, Drive requests | Ported from `pyicloud` 2.7.0. The SRP maths is checked byte for byte against the reference Python library and the request sequences against scripted stand-ins. **Confirmed on a real account:** sign-in with a text-message code, listing folders and downloading files. **Not confirmed yet:** uploads, and the code-on-your-devices method (see Signing in). |
+| Sign-in, Drive requests | Sign-in happens on icloud.com in a browser (see Signing in). Drive requests are ported from `pyicloud` 2.7.0 and checked against scripted stand-ins. **Confirmed on a real account:** browser sign-in, listing folders and downloading files. **Not confirmed yet:** uploads. |
 | Installer window | Run headlessly in demo mode and inspected screenshot by screenshot; used on a real desktop as far as the sign-in step. |
-
-`icloudctl auth` sends the password proof once and never retries, so a mismatch cannot lock your account by itself.
 
 Linux only. FUSE 3 and systemd (user services) are required.
 
@@ -65,7 +63,7 @@ install -m 755 target/release/{icloudctl,icloudd,icloud-status,icloud-installer}
 icloud-installer        # or "iCloud for Linux Setup" in your app menu
 ```
 
-Six pages: requirements → folder → Apple ID → verification code → setup → done. It runs the same steps as `icloudctl init`, `configure`, `auth` and `start`, including the two-factor prompt. `icloud-installer --demo` walks through it without an Apple account and without changing anything (code `123456`).
+It checks the requirements, asks for the folder, opens icloud.com for the sign-in, and sets everything up: the same steps as `icloudctl init`, `auth` and `start`. `icloud-installer --demo` walks through it without an Apple account and without changing anything.
 
 ### Or from the terminal
 
@@ -77,27 +75,15 @@ or step by step:
 
 ```bash
 icloudctl init ~/iCloud
-icloudctl configure you@example.com
-icloudctl auth
+icloudctl auth          # sign in on icloud.com, in a browser window
 icloudctl start
 ```
 
 ## Signing in
 
-Apple ID sign-in uses SRP, so your password is never sent to Apple in the clear, and it is **not stored unless you ask** (`icloudctl configure --store-password`, or the checkbox in the installer). Without it, an expired session means running `icloudctl auth` again, which happens every few weeks. With it, the service renews a trusted session by itself.
+You sign in on icloud.com, in a browser window: `icloudctl auth`, the installer, or a click on the "session expired" notification. A Chromium-based browser opens with a temporary profile (Chromium, Chrome, Brave, Brave Origin, Edge, Vivaldi, or the system default browser if it is one of them; `ICLOUD_BROWSER` picks another, `ICLOUD_BROWSER_ARGS` adds flags). You type your Apple ID, password and verification code there, on Apple's page; this program never sees them. It takes the browser's Apple cookies from that profile, has Apple confirm them, saves the session and the Apple ID, and deletes the profile. No password is stored anywhere.
 
-Two-factor works three ways:
-
-| Method | |
-|---|---|
-| Text message | `icloudctl auth --force-sms`, or type `sms` at the prompt. Works for every account with a trusted phone number, and is what the installer offers. |
-| Code from a trusted device | Type the six digits your iPhone/iPad/Mac shows. Only for accounts where Apple sends it by itself; see below. |
-| Sign in on icloud.com | What the installer does, and `icloudctl auth --from-browser`. A Chromium-based browser opens on icloud.com with a temporary profile (Chromium, Chrome, Brave, Brave Origin, Edge, Vivaldi, or the system default browser if it is one of them; `ICLOUD_BROWSER` picks another, `ICLOUD_BROWSER_ARGS` adds flags). You type your Apple ID, password and code there, on Apple's page, and choose Trust; this program never sees them. It takes the browser's Apple cookies from that profile, has Apple confirm them, saves the session and the Apple ID, and deletes the profile. No password is stored, so an expired session means signing in this way again. |
-| Browser trust token | `icloudctl auth --trust-token <X-APPLE-WEBAUTH-HSA-TRUST from icloud.com cookies>` skips the code. |
-
-Not supported: Apple's newer push-to-device bridge and hardware security keys. On most accounts Apple no longer shows a code on your devices unless the app performs that push handshake (the sign-in page announces it as `auth/bridge/step`); nothing would ever arrive, so those accounts are steered to the text message instead of being left waiting. If your account can only use those, sign in at icloud.com once and import the trust token above. If a push popup appears instead of a code, use the text message.
-
-A wrong code counts towards Apple locking the account, so the installer and `icloudctl auth` both stop after three.
+While the service runs it renews the session every few minutes, the way icloud.com does from an open tab, and once more when iCloud stops accepting it. If Apple ends the session anyway, opening a file that is not downloaded yet shows a notification; click it to sign in again. `icloudctl auth` restarts the service with the new session when it is done.
 
 ## Everyday commands
 
@@ -148,17 +134,16 @@ This replaces the old `icloud_status.py` Nautilus extension, minus one thing: th
 ## Security
 
 - No `unsafe` code anywhere in the workspace (`unsafe_code = "forbid"`); system calls go through `rustix`.
-- Passwords are wrapped so they cannot reach a log or a `Debug` print, and are not stored by default.
+- No password is ever typed into, sent by or stored by this program: the sign-in happens on Apple's page.
 - Session, config, cache and log files are created with mode 0600/0700 and written atomically.
 - Paths are a validated type that cannot contain `..`, so neither a hostile file name from iCloud nor a crafted request can leave the mirror. Server-sent names that are not valid file names are ignored.
-- A server asking for an absurd PBKDF2 iteration count is refused instead of burning CPU.
-- One sign-in attempt sends one password proof; nothing retries it. A daemon whose session is gone starts read-only ("unauthenticated") rather than crash-looping.
+- A daemon whose session is gone starts read-only ("unauthenticated") rather than crash-looping, and stops asking iCloud until you sign in again.
 
 ## Moving from the Python version
 
 `config.yaml` is read unchanged, and the existing cache and state database are reused. What changes:
 
-- **Sign in again once.** Session files are in a new format: `icloudctl auth`.
+- **Sign in again once.** Session files are in a new format: `icloudctl auth`. A `password` left in `config.yaml` is no longer used; `icloudctl doctor` reminds you to delete it.
 - `fuse_options` (`ro`, `allow_other`) now actually take effect; the old code never read them.
 - Deletes go to the trash by default instead of being permanent.
 - Mode options with an unknown value are an error instead of silently falling back.
@@ -169,7 +154,7 @@ This replaces the old `icloud_status.py` Nautilus extension, minus one thing: th
 
 ```
 crates/
-  icloud-api/        HTTP client: SRP, two-factor, sessions, the Drive service. `MemoryDrive` for tests.
+  icloud-api/        HTTP client: sessions and their renewal, the Drive service. `MemoryDrive` for tests.
   icloud-core/       config, state database, mirror, sync engine, filesystem semantics, setup, installer logic.
   icloudd/           the FUSE daemon (a thin adapter over icloud-core).
   icloudctl/         the command line tool.
@@ -201,9 +186,9 @@ icloudctl doctor      # first thing to try
 icloudctl logs
 ```
 
-- **Sign-in says the email/password is wrong** — the message ends with what Apple actually answered, e.g. `(Apple replied: … -20101 …)` for a wrong password or `403` for a locked or throttled account. Run `icloudctl -v auth` to see each request's address and status code (never passwords, tokens or cookies); the installer does the same with `ICLOUD_LOG=debug icloud-installer`. Check the password at <https://account.apple.com> first, and do not retry more than a couple of times: repeated failures lock the account.
+- **The sign-in does not finish** — run `icloudctl -v auth` to see each request's address and status code (never tokens or cookies); the installer does the same with `ICLOUD_LOG=debug icloud-installer`.
 - **A picture or PDF shows a generic icon** — its contents are not downloaded just to draw a thumbnail when the file is larger than `preview_max_bytes`. Right-click ▸ Scripts ▸ Download from iCloud, or open it.
-- **`UNAUTHENTICATED mode` in the logs** — the session is gone. `icloudctl auth`, then `icloudctl restart`.
+- **`UNAUTHENTICATED mode` in the logs, or a file that opens to "input/output error"** — the session is gone: `icloudctl auth`, or click the notification.
 - **The whole drive starts downloading by itself** — the desktop indexer is walking the mount: `icloudctl trackerignore`.
 - **A folder looks empty** — check `icloudctl logs` for a `list-directory-start` with no matching `list-directory-complete`; the listing request failed.
 - **`icloudctl hydrate` finds little to do** — in lazy mode only folders you have opened are known. Walk a tree first (`find ~/iCloud/Downloads -type d >/dev/null`) or set `crawl_mode: full`.

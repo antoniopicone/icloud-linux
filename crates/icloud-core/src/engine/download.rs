@@ -43,6 +43,7 @@ impl Engine {
             return Ok(());
         };
 
+        self.require_session()?;
         sync_event!(info, "hydrate-start", path = path, drivewsid = node.drivewsid, size = node.size);
         let staged = {
             let _gate = lock(&inner.download_gate);
@@ -389,6 +390,21 @@ mod tests {
         rig.engine.download_job(&job);
         assert_eq!(rig.engine.stats().downloads_queued, 0, "retrying cannot fix an expired session");
         assert!(rig.engine.auth_lost());
+    }
+
+    #[test]
+    fn once_the_session_is_lost_opening_a_placeholder_fails_at_once() {
+        let rig = rig_with_file();
+        rig.drive.set_outage(Some(Outage::SessionExpired));
+        let path = Rig::path("/f.txt");
+        assert!(rig.engine.hydrate(&path).unwrap_err().is_auth());
+        let asked = rig.drive.calls_matching("open:");
+
+        for _ in 0..5 {
+            assert!(rig.engine.hydrate(&path).unwrap_err().is_auth());
+        }
+        assert_eq!(rig.drive.calls_matching("open:"), asked, "an application retrying its read does not reach iCloud");
+        assert!(!rig.entry("/f.txt").unwrap().hydrated);
     }
 
     #[test]

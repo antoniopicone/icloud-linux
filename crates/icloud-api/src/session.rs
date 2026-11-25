@@ -1,8 +1,7 @@
-//! HTTP session: cookie jar, Apple's session headers, persistence and the
-//! normalisation of Apple's many error shapes into [`Error`].
+//! HTTP session: cookie jar, persistence and the normalisation of Apple's
+//! many error shapes into [`Error`].
 //!
-//! One [`Session`] is shared by the authentication code and by every Drive
-//! request. It is `Send + Sync`; concurrent requests are fine, the parts that
+//! One [`Session`] is shared by the client and by every Drive request. It is `Send + Sync`; concurrent requests are fine, the parts that
 //! mutate (cookies, session data, files on disk) are behind locks.
 
 use std::{
@@ -41,86 +40,12 @@ const STREAM_MIN_BYTES_PER_SEC: u64 = 32 * 1024;
 pub(crate) const CT_JSON: &str = "application/json";
 pub(crate) const CT_PLAIN: &str = "plain/text";
 
-/// Mapping from Apple's response headers to the fields kept in the session.
-const HEADER_TO_FIELD: [(&str, Field); 10] = [
-    ("X-Apple-ID-Account-Country", Field::AccountCountry),
-    ("X-Apple-ID-Session-Id", Field::SessionId),
-    ("X-Apple-Auth-Attributes", Field::AuthAttributes),
-    ("X-Apple-Session-Token", Field::SessionToken),
-    ("X-Apple-TwoSV-Trust-Token", Field::TrustToken),
-    ("X-Apple-TwoSV-Trust-Eligible", Field::TrustEligible),
-    ("X-Apple-OAuth-Grant-Code", Field::GrantCode),
-    ("X-Apple-I-Rscd", Field::AppleRscd),
-    ("X-Apple-I-Ercd", Field::AppleErcd),
-    ("scnt", Field::Scnt),
-];
-
-#[derive(Clone, Copy)]
-enum Field {
-    AccountCountry,
-    SessionId,
-    AuthAttributes,
-    SessionToken,
-    TrustToken,
-    TrustEligible,
-    GrantCode,
-    AppleRscd,
-    AppleErcd,
-    Scnt,
-}
-
-/// Values Apple hands out in headers and expects back on later requests.
-/// Everything here is sensitive; `Debug` prints only which fields are set.
-#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// What is kept next to the cookies. The id iCloud's web services know this
+/// client by stays the same from one run to the next, as a browser's would.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_country: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_attributes: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trust_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trust_eligible: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub apple_rscd: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub apple_ercd: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scnt: Option<String>,
-}
-
-impl std::fmt::Debug for SessionData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionData")
-            .field("has_session_token", &self.session_token.is_some())
-            .field("has_trust_token", &self.trust_token.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl SessionData {
-    fn slot(&mut self, field: Field) -> &mut Option<String> {
-        match field {
-            Field::AccountCountry => &mut self.account_country,
-            Field::SessionId => &mut self.session_id,
-            Field::AuthAttributes => &mut self.auth_attributes,
-            Field::SessionToken => &mut self.session_token,
-            Field::TrustToken => &mut self.trust_token,
-            Field::TrustEligible => &mut self.trust_eligible,
-            Field::GrantCode => &mut self.grant_code,
-            Field::AppleRscd => &mut self.apple_rscd,
-            Field::AppleErcd => &mut self.apple_ercd,
-            Field::Scnt => &mut self.scnt,
-        }
-    }
 }
 
 /// A cookie taken from a browser the person signed in with.
@@ -280,22 +205,11 @@ impl Session {
         self.client.post(url)
     }
 
-    pub fn put(&self, url: &str) -> RequestBuilder {
-        self.client.put(url)
-    }
-
-    /// Snapshot of the session data.
     pub fn data(&self) -> SessionData {
         lock(&self.data).clone()
     }
 
     /// Change the session data and persist it if it changed.
-    pub fn update_data(&self, change: impl FnOnce(&mut SessionData)) {
-        change(&mut lock(&self.data));
-        self.persist_data();
-    }
-
-    /// Value of the first unexpired cookie called `name`, on any domain.
     pub fn cookie(&self, name: &str) -> Option<String> {
         let store = self.jar.lock().unwrap_or_else(PoisonError::into_inner);
         store.iter_unexpired().find(|c| c.name() == name && !c.value().is_empty()).map(|c| c.value().to_owned())
@@ -316,7 +230,7 @@ impl Session {
     }
 
     /// Like [`send`](Self::send) but leaves the status for the caller to
-    /// interpret. Session headers are still absorbed.
+    /// interpret.
     pub fn send_unchecked(&self, request: RequestBuilder) -> Result<ApiResponse> {
         let response = request.send()?;
         let status = response.status().as_u16();
@@ -324,7 +238,6 @@ impl Session {
         let headers = response.headers().clone();
         let mut body = Vec::new();
         response.take(MAX_BODY_BYTES).read_to_end(&mut body)?;
-        self.absorb_headers(&headers);
         Ok(ApiResponse { status, headers, body })
     }
 
@@ -332,7 +245,6 @@ impl Session {
     /// turned into [`Error`] using at most 64 KiB of the body.
     pub fn send_stream(&self, request: RequestBuilder, expected_len: u64) -> Result<Response> {
         let response = request.timeout(Self::transfer_timeout(expected_len)).send()?;
-        self.absorb_headers(response.headers());
         if response.status().is_success() {
             return Ok(response);
         }
@@ -351,26 +263,6 @@ impl Session {
     /// the transfer would take at a very slow but still useful rate.
     pub fn transfer_timeout(len: u64) -> Duration {
         STREAM_BASE_TIMEOUT + Duration::from_secs(len / STREAM_MIN_BYTES_PER_SEC)
-    }
-
-    fn absorb_headers(&self, headers: &HeaderMap) {
-        let mut changed = false;
-        {
-            let mut data = lock(&self.data);
-            for (name, field) in HEADER_TO_FIELD {
-                let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()) else {
-                    continue;
-                };
-                let slot = data.slot(field);
-                if slot.as_deref() != Some(value) {
-                    *slot = Some(value.to_owned());
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            self.persist_data();
-        }
     }
 
     /// Turn Apple's status and body conventions into a `Result`.
@@ -397,13 +289,13 @@ impl Session {
     fn classify_error(&self, response: &ApiResponse) -> Error {
         let body: Option<Value> = response.json().ok();
         if response.status == 409 && response.is_json() && is_hsa2_challenge(body.as_ref()) {
-            return Error::TwoFactorRequired;
+            return Error::AuthRequired("the session needs a verification code: sign in again on icloud.com".into());
         }
         if response.status == 450 {
             return Error::AuthRequired("re-authentication required".into());
         }
         if let Some(Value::Object(map)) = &body
-            && let Some(err) = api_error_from_body(map).or_else(|| service_error(map))
+            && let Some(err) = api_error_from_body(map)
         {
             return err;
         }
@@ -508,15 +400,6 @@ fn api_error_from_body(map: &serde_json::Map<String, Value>) -> Option<Error> {
     Some(make_api_error(code, reason))
 }
 
-/// The `serviceErrors` list Apple's identity endpoints use, e.g.
-/// `{"code": "-20101", "message": "Your Apple Account or password was incorrect."}`.
-fn service_error(map: &serde_json::Map<String, Value>) -> Option<Error> {
-    let first = map.get("serviceErrors")?.as_array()?.first()?;
-    let reason = first.get("message").and_then(Value::as_str)?.to_owned();
-    let code = first.get("code").map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned));
-    Some(Error::Api { code, reason })
-}
-
 /// Log the outcome of a request: status and address, never the query string,
 /// headers or body.
 fn trace_reply(response: &Response) {
@@ -536,7 +419,9 @@ fn is_falsy(value: &Value) -> bool {
 }
 
 fn make_api_error(code: Option<String>, reason: String) -> Error {
-    if reason == "Missing X-APPLE-WEBAUTH-TOKEN cookie" {
+    // What iCloud's web services say once the session's cookies have lapsed.
+    // Unlike the generic 421 above, these name the session explicitly.
+    if reason == "Missing X-APPLE-WEBAUTH-TOKEN cookie" || reason.eq_ignore_ascii_case("Invalid global session") {
         return Error::AuthRequired(reason);
     }
     match code.as_deref() {
@@ -632,6 +517,13 @@ mod tests {
     }
 
     #[test]
+    fn a_lapsed_global_session_is_an_auth_error_whatever_the_status() {
+        let body = serde_json::json!({"error": "Invalid global session"});
+        assert!(matches!(api_error_from_body(obj(&body)), Some(Error::AuthRequired(_))));
+        assert!(make_api_error(Some("421".into()), "Invalid global session".into()).is_auth());
+    }
+
+    #[test]
     fn hsa2_challenge_detection_accepts_both_field_names() {
         assert!(is_hsa2_challenge(Some(&serde_json::json!({"authType": "hsa2"}))));
         assert!(is_hsa2_challenge(Some(&serde_json::json!({"authenticationType": "hsa2"}))));
@@ -640,19 +532,10 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_hides_tokens() {
-        let data = SessionData { session_token: Some("secret-token".into()), ..SessionData::default() };
-        let shown = format!("{data:?}");
-        assert!(!shown.contains("secret-token"));
-        assert!(shown.contains("has_session_token: true"));
-    }
-
-    #[test]
     fn session_data_and_cookies_survive_a_restart_with_private_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let cookies = dir.path().join("state");
         let session = Session::open("me@example.com", Some(&cookies), "https://www.icloud.com", "cid-1").unwrap();
-        session.update_data(|d| d.session_token = Some("tok".into()));
         session.flush().unwrap();
 
         let session_file = cookies.join("meexamplecom.session");
@@ -662,7 +545,6 @@ mod tests {
         assert_eq!(dir_mode, 0o700);
 
         let again = Session::open("me@example.com", Some(&cookies), "https://www.icloud.com", "cid-2").unwrap();
-        assert_eq!(again.data().session_token.as_deref(), Some("tok"));
         assert_eq!(again.data().client_id.as_deref(), Some("cid-1"), "client id is sticky");
 
         again.clear();
@@ -708,12 +590,10 @@ mod tests {
             expires: Some(4_102_444_800.0),
         };
         temporary.import_cookies(&[cookie]);
-        temporary.update_data(|d| d.trust_token = Some("trust".into()));
         temporary.save_as("me@example.com", dir.path()).unwrap();
 
         let reopened = Session::open("me@example.com", Some(dir.path()), "https://www.icloud.com", "cid-2").unwrap();
         assert!(reopened.has_credentials());
-        assert_eq!(reopened.data().trust_token.as_deref(), Some("trust"));
         assert_eq!(reopened.data().client_id.as_deref(), Some("cid-1"));
         let mode = fs::metadata(dir.path().join("meexamplecom.cookiejar")).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -725,7 +605,7 @@ mod tests {
         fs::write(dir.path().join("mecom.session"), b"{not json").unwrap();
         fs::write(dir.path().join("mecom.cookiejar"), b"garbage").unwrap();
         let session = Session::open("me.com", Some(dir.path()), "https://www.icloud.com", "cid").unwrap();
-        assert!(session.data().session_token.is_none());
+        assert_eq!(session.data().client_id.as_deref(), Some("cid"));
         assert!(!session.has_credentials());
     }
 }

@@ -17,7 +17,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// One-command guided setup: init, configure, auth, start.
+    /// One-command guided setup: init, sign in on icloud.com, start.
     Quickstart {
         /// Where to mount iCloud Drive (default: ~/iCloud).
         mount_dir: Option<PathBuf>,
@@ -27,32 +27,17 @@ pub enum Command {
         /// Where to mount iCloud Drive (default: ~/iCloud).
         mount_dir: Option<PathBuf>,
     },
-    /// Record your Apple ID in config.yaml.
-    Configure {
-        /// Apple ID (asked for if omitted).
-        email: Option<String>,
-        /// Also store the password so the service can renew an expired session
-        /// by itself. Off by default: without it, an expired session needs
-        /// `icloudctl auth` again.
-        #[arg(long)]
-        store_password: bool,
-    },
-    /// Sign in to iCloud interactively, including two-factor authentication.
+    /// Sign in on icloud.com in a browser window, and restart the service
+    /// with the new session if it is running.
+    ///
+    /// The Apple ID, the password and the verification code are typed on
+    /// Apple's page and never reach this program. Needs a Chromium-based
+    /// browser.
     Auth {
-        /// Have the verification code sent by SMS.
+        /// Report the outcome as a desktop notification. This is how the
+        /// "session expired" notification runs it.
         #[arg(long)]
-        force_sms: bool,
-        /// Import a `X-APPLE-WEBAUTH-HSA-TRUST` value from a signed-in browser.
-        #[arg(long, value_name = "TOKEN")]
-        trust_token: Option<String>,
-        /// Sign in on icloud.com in a browser window instead of here: the
-        /// password and the code are typed on Apple's page and never reach
-        /// this program. Needs a Chromium-based browser.
-        #[arg(long, conflicts_with_all = ["trust_token", "force_sms"])]
-        from_browser: bool,
-        /// Show what Apple reported about the challenge, and enable `--verbose`.
-        #[arg(long)]
-        debug: bool,
+        notify: bool,
     },
     /// Start the service.
     Start,
@@ -157,14 +142,8 @@ mod tests {
     fn commands_from_the_python_era_keep_their_names_and_flags() {
         assert!(matches!(parse(&["quickstart"]), Command::Quickstart { mount_dir: None }));
         assert!(matches!(parse(&["init", "/mnt/x"]), Command::Init { mount_dir: Some(_) }));
-        assert!(matches!(
-            parse(&["auth", "--force-sms", "--debug"]),
-            Command::Auth { force_sms: true, debug: true, .. }
-        ));
-        assert!(
-            matches!(parse(&["auth", "--trust-token", "abc"]), Command::Auth { trust_token: Some(t), .. } if t == "abc")
-        );
-        assert!(matches!(parse(&["auth", "--from-browser"]), Command::Auth { from_browser: true, .. }));
+        assert!(matches!(parse(&["auth"]), Command::Auth { notify: false }));
+        assert!(matches!(parse(&["auth", "--notify"]), Command::Auth { notify: true }));
         assert!(matches!(
             parse(&["hydrate", "--dry-run", "--verbose"]),
             Command::Hydrate { dry_run: true, verbose: true }
@@ -191,18 +170,12 @@ mod tests {
     }
 
     #[test]
-    fn the_password_is_not_stored_unless_asked() {
-        assert!(matches!(parse(&["configure", "me@x.com"]), Command::Configure { store_password: false, .. }));
-        assert!(matches!(
-            parse(&["configure", "--store-password"]),
-            Command::Configure { store_password: true, email: None }
-        ));
-    }
-
-    #[test]
     fn unknown_commands_and_flags_are_rejected() {
         assert!(Cli::try_parse_from(["icloudctl", "frobnicate"]).is_err());
         assert!(Cli::try_parse_from(["icloudctl", "start", "--now"]).is_err());
+        // The Apple ID and the password are only ever typed on icloud.com.
+        assert!(Cli::try_parse_from(["icloudctl", "configure", "me@x.com"]).is_err());
+        assert!(Cli::try_parse_from(["icloudctl", "auth", "--force-sms"]).is_err());
         assert!(Cli::try_parse_from(["icloudctl"]).is_err());
     }
 }

@@ -257,10 +257,17 @@ impl Engine {
         }
     }
 
+    /// Refuse to ask iCloud anything once it has refused the session and
+    /// renewing it failed: every request would be turned down the same way,
+    /// and a person opening a file is better served by an immediate error.
+    fn require_session(&self) -> Result<()> {
+        if self.auth_lost() { Err(crate::Error::Unauthenticated) } else { Ok(()) }
+    }
+
     /// Remember that a failure needs a new sign-in, if it does.
     fn note_failure(&self, err: &crate::Error) {
         if err.is_auth() && !self.inner.auth_lost.swap(true, Ordering::Relaxed) {
-            tracing::error!("the iCloud session is no longer valid. Run `icloudctl auth`, then `icloudctl restart`.");
+            tracing::error!("the iCloud session is no longer valid. Run `icloudctl auth` to sign in again.");
         }
     }
 

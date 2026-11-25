@@ -42,7 +42,6 @@ cast_precision_loss = "allow"
 # Style lints whose "fix" would make the code less readable here.
 unused_self = "allow"           # methods kept as methods for a uniform call style
 struct_field_names = "allow"
-many_single_char_names = "allow"  # the SRP maths follows the RFC's letters
 needless_pass_by_value = "allow"
 items_after_statements = "allow"
 assigning_clones = "allow"

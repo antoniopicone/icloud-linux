@@ -1,15 +1,9 @@
 # icloud-linux configuration. Copy to ~/.config/icloud-linux/config.yaml (mode 0600),
 # or let `icloudctl init` / `icloud-installer` create it. Every key is optional.
 ---
-# Your Apple ID (email address or phone number).
+# Your Apple ID. `icloudctl auth` writes it after you sign in on icloud.com;
+# there is no password here, and none is ever stored.
 username: "your_apple_id@example.com"
-
-# OPTIONAL and best left out. With a stored password the service can renew an
-# expired session by itself (a trusted session needs no verification code).
-# Without it, an expired session means running `icloudctl auth` again, which
-# happens every few weeks. If you do store it, keep this file at mode 0600.
-#
-# password: "your_apple_id_password"
 
 # Where the local mirror and the sync database live.
 cache_dir: "~/.cache/icloud-linux"

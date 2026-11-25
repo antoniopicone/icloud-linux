@@ -1,11 +1,9 @@
 //! Everything the guided installer does, without a toolkit.
 //!
-//! The installer walks the same steps as `icloudctl` does: `init`,
-//! `configure`, `auth`, `start`. Here each is a method of a [`Backend`], so
+//! The installer walks the same steps as `icloudctl` does: `init`, `auth`
+//! (on icloud.com, in a browser) and `start`. Here each is a method of a [`Backend`], so
 //! the GTK window is only a view over this logic and the whole flow is tested
 //! (and demoed) without a display or a real iCloud account.
-
-mod auth_worker;
 
 use std::{
     path::{Path, PathBuf},
@@ -14,13 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub use auth_worker::{AuthEvent, AuthRequest, AuthWorker, Authenticator, Channel, MAX_CODE_ATTEMPTS};
 use icloud_api::AccountInfo;
-use secrecy::SecretString;
 
 use crate::{
     config::{Config, CrawlMode},
-    connect::client_for,
     dirs::Layout,
     error::{Error, Result},
     i18n::{tr, tr_text, trf},
@@ -39,8 +34,6 @@ pub struct InstallPlan {
     pub show_sidebar_status: bool,
     /// Add "Download from iCloud" to the right-click menu of the file manager.
     pub add_context_menu: bool,
-    /// Save the password so an expired session can be renewed unattended.
-    pub remember_password: bool,
 }
 
 impl InstallPlan {
@@ -51,7 +44,6 @@ impl InstallPlan {
             keep_indexer_out: true,
             show_sidebar_status: true,
             add_context_menu: true,
-            remember_password: false,
         }
     }
 }
@@ -91,11 +83,7 @@ pub trait Backend: Send + Sync {
     fn preflight(&self) -> Vec<Check>;
     /// `icloudctl init`: directories, default configuration, systemd unit.
     fn prepare(&self, plan: &InstallPlan) -> Result<Prepared>;
-    /// `icloudctl configure`: remember the Apple ID.
-    fn save_account(&self, username: &str, password: Option<SecretString>) -> Result<()>;
-    /// The object that signs in (`icloudctl auth`).
-    fn authenticator(&self) -> Result<Box<dyn Authenticator>>;
-    /// `icloudctl auth --from-browser`: the person signs in on icloud.com in
+    /// `icloudctl auth`: the person signs in on icloud.com in
     /// a browser window; the session and the Apple ID are saved. Blocks until
     /// they are done (at most [`crate::browser::SIGN_IN_TIMEOUT`]).
     fn sign_in_with_browser(&self) -> Result<AccountInfo>;
@@ -164,14 +152,6 @@ impl Backend for SystemBackend {
         Ok(Prepared { mount_dir: report.mount_dir, used_fallback: report.used_fallback })
     }
 
-    fn save_account(&self, username: &str, password: Option<SecretString>) -> Result<()> {
-        setup::configure(&self.layout, username, password).map(drop)
-    }
-
-    fn authenticator(&self) -> Result<Box<dyn Authenticator>> {
-        Ok(Box::new(client_for(&self.config()?)?))
-    }
-
     fn sign_in_with_browser(&self) -> Result<AccountInfo> {
         crate::browser::sign_in_and_save(&self.layout, &mut || {})
     }
@@ -235,28 +215,6 @@ pub fn wait_until_mounted(mount: &Path, timeout: Duration) -> bool {
     setup::is_mounted(mount)
 }
 
-/// Check what the user typed before anything is done with it.
-pub fn validate_account(username: &str, password: &str) -> std::result::Result<(), &'static str> {
-    let username = username.trim();
-    if username.is_empty() {
-        return Err("Enter your Apple ID.");
-    }
-    if username.contains(char::is_whitespace) {
-        return Err("An Apple ID is an email address or phone number, without spaces.");
-    }
-    if password.is_empty() {
-        return Err("Enter your Apple ID password.");
-    }
-    Ok(())
-}
-
-/// Turn "how many digits are typed" into whether the Verify button is usable.
-pub fn code_is_complete(code: &str) -> bool {
-    let digits = code.chars().filter(char::is_ascii_digit).count();
-    let others = code.chars().filter(|c| !c.is_ascii_digit() && !c.is_whitespace() && *c != '-').count();
-    others == 0 && (4..=10).contains(&digits)
-}
-
 /// The plan's mount folder must be somewhere the daemon can mount.
 pub fn validate_mount_dir(dir: &Path, layout: &Layout) -> std::result::Result<(), String> {
     if !dir.is_absolute() {
@@ -285,7 +243,7 @@ pub fn ensure_error(message: impl Into<String>) -> Error {
 mod tests {
     use std::sync::Mutex;
 
-    use super::{auth_worker::tests::Fake, *};
+    use super::*;
     use crate::setup::CommandOutput;
 
     #[derive(Default)]
@@ -317,29 +275,8 @@ mod tests {
         assert_eq!(plan.mount_dir, Path::new("/home/u/iCloud"));
         assert_eq!(plan.crawl_mode, CrawlMode::Lazy);
         assert!(plan.keep_indexer_out);
-        assert!(!plan.remember_password, "storing the password must be an explicit choice");
         assert!(plan.show_sidebar_status, "seeing what iCloud is doing is part of the experience");
         assert!(plan.add_context_menu);
-    }
-
-    #[test]
-    fn account_input_is_validated() {
-        assert!(validate_account("me@example.com", "pw").is_ok());
-        assert!(validate_account("  me@example.com  ", "pw").is_ok());
-        assert!(validate_account("", "pw").is_err());
-        assert!(validate_account("me @example.com", "pw").is_err());
-        assert!(validate_account("me@example.com", "").is_err());
-    }
-
-    #[test]
-    fn a_code_is_complete_at_four_to_ten_digits() {
-        assert!(code_is_complete("123456"));
-        assert!(code_is_complete("123 456"));
-        assert!(code_is_complete("123-456"));
-        assert!(!code_is_complete("123"));
-        assert!(!code_is_complete("12345a"));
-        assert!(!code_is_complete(""));
-        assert!(!code_is_complete("12345678901"));
     }
 
     #[test]
@@ -387,17 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn saving_the_account_honours_the_password_choice() {
-        let (_d, layout, _sys, backend) = backend();
-        backend.save_account("me@example.com", None).unwrap();
-        let text = std::fs::read_to_string(layout.config_file()).unwrap();
-        assert!(text.contains("me@example.com") && !text.contains("password"));
-        backend.save_account("me@example.com", Some(SecretString::from("pw".to_owned()))).unwrap();
-        assert!(std::fs::read_to_string(layout.config_file()).unwrap().contains("password"));
-        assert!(backend.save_account("bad id", None).is_err());
-    }
-
-    #[test]
     fn finishing_stops_at_the_first_failure_and_says_why() {
         let (_d, layout, sys, backend) = backend();
         *sys.fail.lock().unwrap() = Some("start".into());
@@ -416,15 +342,6 @@ mod tests {
     }
 
     #[test]
-    fn the_authenticator_needs_a_configured_apple_id() {
-        let (_d, layout, _sys, backend) = backend();
-        assert!(backend.authenticator().is_err());
-        backend.save_account("me@example.com", None).unwrap();
-        assert!(backend.authenticator().is_ok());
-        drop(layout);
-    }
-
-    #[test]
     fn preflight_only_lists_what_matters_before_installing() {
         let (_d, _layout, _sys, backend) = backend();
         let checks = backend.preflight();
@@ -433,21 +350,5 @@ mod tests {
             assert!(matches!(check.severity, Severity::Ok | Severity::Missing), "{check:?}");
             assert!(!check.message.contains("config"), "config problems are expected before install");
         }
-    }
-
-    #[test]
-    fn a_full_scripted_wizard_run_ends_authenticated() {
-        // The path a GUI takes: account, sign in with 2FA, verify.
-        let (mut fake, log) = Fake::new();
-        fake.login.push_back(Ok(icloud_api::LoginStatus::TwoFactorRequired));
-        let worker = AuthWorker::spawn(Box::new(fake));
-        worker.request(AuthRequest::Login(SecretString::from("pw".to_owned())));
-        let AuthEvent::CodeNeeded(options) = worker.wait(Duration::from_secs(5)).unwrap() else { panic!() };
-        assert!(options.can_use_sms());
-        worker.request(AuthRequest::SendSms { phone: 0 });
-        assert!(matches!(worker.wait(Duration::from_secs(5)), Some(AuthEvent::SmsSent { .. })));
-        worker.request(AuthRequest::Verify { channel: Channel::Sms(0), code: "123456".into() });
-        assert!(matches!(worker.wait(Duration::from_secs(5)), Some(AuthEvent::Authenticated(_))));
-        assert_eq!(log.lock().unwrap().len(), 3);
     }
 }

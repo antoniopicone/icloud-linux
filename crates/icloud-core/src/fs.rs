@@ -28,6 +28,7 @@ use crate::{
     config::CrawlMode,
     engine::Engine,
     mirror::{Capacity, Mirror},
+    notify::{FailureReporter, OpenFailure},
     path::{IcPath, is_valid_name},
     policy::SyncPolicy,
     reader::{DEFAULT_PREVIEW_MAX_BYTES, Reader, Requester},
@@ -85,6 +86,8 @@ pub struct FsCore {
     /// `None` while there is no iCloud session: the cache is served read-only.
     engine: Option<Engine>,
     options: FsOptions,
+    /// Tells a person why the file they opened could not be downloaded.
+    failures: Option<FailureReporter>,
 }
 
 impl std::fmt::Debug for FsCore {
@@ -118,7 +121,20 @@ impl FsCore {
         engine: Option<Engine>,
         options: FsOptions,
     ) -> Self {
-        Self { mirror, state, policy, engine, options }
+        Self { mirror, state, policy, engine, options, failures: None }
+    }
+
+    /// Report downloads that fail for a person through `reporter`.
+    #[must_use]
+    pub fn with_failure_reporter(mut self, reporter: FailureReporter) -> Self {
+        self.failures = Some(reporter);
+        self
+    }
+
+    fn report_failure(&self, path: &IcPath, failure: OpenFailure) {
+        if let Some(failures) = &self.failures {
+            failures.report(path, failure);
+        }
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -296,7 +312,8 @@ impl FsCore {
         if entry.hydrated || entry.remote_drivewsid.is_none() {
             return Ok(());
         }
-        match who.reader() {
+        let reader = who.reader();
+        match reader {
             Reader::Person => {}
             Reader::Preview if entry.size <= self.options.preview_max_bytes => {}
             other => {
@@ -309,18 +326,27 @@ impl FsCore {
                 return Err(Errno::ACCESS);
             }
         }
+        let person = reader == Reader::Person;
         let Some(engine) = &self.engine else {
             tracing::warn!("{path} is not downloaded and there is no iCloud session; run `icloudctl auth`");
+            if person {
+                self.report_failure(path, OpenFailure::SignInNeeded);
+            }
             return Err(Errno::IO);
         };
         if !self.policy.allows(path) {
             return Err(Errno::ACCESS);
         }
         engine.hydrate(path).map_err(|e| {
-            if e.is_auth() {
-                tracing::error!("cannot download {path}: {e}. Run `icloudctl auth`, then `icloudctl restart`.");
+            let failure = if e.is_auth() {
+                tracing::error!("cannot download {path}: {e}. Run `icloudctl auth` to sign in again.");
+                OpenFailure::SignInNeeded
             } else {
                 tracing::error!("cannot download {path}: {e}");
+                OpenFailure::Unreachable
+            };
+            if person {
+                self.report_failure(path, failure);
             }
             Errno::IO
         })
@@ -840,6 +866,33 @@ mod tests {
         let rig = rig_with_previews(0);
         assert_eq!(rig.fs.read_as(&p("/big.bin"), 0, 3, &Reader::Person).unwrap(), [7, 7, 7]);
         assert_eq!(rig.fs.read(&p("/small.txt"), 0, 3).unwrap(), b"012");
+    }
+
+    #[derive(Clone, Default)]
+    struct Told(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl crate::notify::Notifier for Told {
+        fn notify(&self, note: &crate::notify::Note) {
+            self.0.lock().unwrap().push(format!("{}: {}", note.title, note.body));
+        }
+    }
+
+    #[test]
+    fn a_person_whose_file_cannot_be_downloaded_is_told_why_and_a_thumbnailer_is_not() {
+        use icloud_api::memory::Outage;
+
+        let mut rig = rig_with_previews(1000);
+        let told = Told::default();
+        rig.fs.failures = Some(FailureReporter::new(told.clone()));
+        rig.drive.set_outage(Some(Outage::SessionExpired));
+
+        assert_eq!(rig.fs.read_as(&p("/small.txt"), 0, 4, &Reader::Preview).unwrap_err(), Errno::IO);
+        assert!(told.0.lock().unwrap().is_empty(), "nobody asked a thumbnailer to download anything");
+
+        assert_eq!(rig.fs.open_as(&p("/big.bin"), false, &Reader::Person).unwrap_err(), Errno::IO);
+        let told = told.0.lock().unwrap();
+        assert_eq!(told.len(), 1);
+        assert!(told[0].starts_with("Could not open “big.bin”") && told[0].contains("sign in again"), "{}", told[0]);
     }
 
     #[test]

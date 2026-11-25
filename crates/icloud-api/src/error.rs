@@ -28,16 +28,11 @@ pub enum Error {
     #[error("{}", ApiDisplay(.code, .reason))]
     Api { code: Option<String>, reason: String },
 
-    /// The account has two-factor authentication and the session is not
-    /// trusted yet. Not a failure: the caller is expected to ask for a code.
-    #[error("two-factor authentication is required")]
-    TwoFactorRequired,
-
-    /// The stored session is no longer accepted. Interactive re-login needed.
+    /// The stored session is no longer accepted: sign in again on icloud.com.
     #[error("the iCloud session is no longer valid: {0}")]
     AuthRequired(String),
 
-    /// Apple rejected the credentials, or the login handshake failed.
+    /// Apple did not accept a new sign-in (the cookies of a browser sign-in).
     #[error("login failed: {0}")]
     LoginFailed(String),
 
@@ -48,12 +43,6 @@ pub enum Error {
     /// The server did something the protocol does not allow for.
     #[error("protocol error: {0}")]
     Protocol(String),
-
-    #[error("no trusted phone number is available to send a code to")]
-    NoTrustedPhone,
-
-    #[error("the verification code was not accepted")]
-    WrongCode,
 }
 
 struct ApiDisplay<'a>(&'a Option<String>, &'a str);
@@ -80,6 +69,6 @@ impl Error {
     /// authentication is *not* one of these, because Apple also uses it for
     /// transient server-side failures that succeed on retry.
     pub fn is_auth(&self) -> bool {
-        matches!(self, Self::TwoFactorRequired | Self::AuthRequired(_) | Self::LoginFailed(_))
+        matches!(self, Self::AuthRequired(_) | Self::LoginFailed(_))
     }
 }

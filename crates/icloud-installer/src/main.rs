@@ -1,7 +1,7 @@
 //! `icloud-installer`: a guided setup for icloud-linux.
 //!
-//! Walks through the same steps as `icloudctl init`, `configure`,
-//! `auth --from-browser` and `start`, in a libadwaita window.
+//! Walks through the same steps as `icloudctl init`, `auth` and `start`,
+//! in a libadwaita window.
 //!
 //! `--demo` runs the whole wizard against a pretend system (the sign-in is
 //! pretended too) so it can be tried without an Apple account and without

@@ -15,6 +15,7 @@ pub mod hydrate;
 pub mod i18n;
 pub mod installer;
 pub mod mirror;
+pub mod notify;
 pub mod path;
 pub mod policy;
 pub mod reader;

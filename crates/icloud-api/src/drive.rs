@@ -175,6 +175,37 @@ pub trait Drive: Send + Sync {
     fn move_to(&self, node: &Node, destination: &Node) -> Result<()>;
 }
 
+/// A shared drive is a drive, so wrappers can hold an `Arc` to one.
+impl<D: Drive + ?Sized> Drive for std::sync::Arc<D> {
+    fn root(&self) -> Result<Node> {
+        (**self).root()
+    }
+    fn node(&self, drivewsid: &str, share_id: Option<&Value>) -> Result<Node> {
+        (**self).node(drivewsid, share_id)
+    }
+    fn children(&self, folder: &Node) -> Result<Vec<Node>> {
+        (**self).children(folder)
+    }
+    fn open(&self, file: &Node) -> Result<Box<dyn Read + Send>> {
+        (**self).open(file)
+    }
+    fn upload(&self, parent: &Node, name: &str, source: File, mtime: i64) -> Result<()> {
+        (**self).upload(parent, name, source, mtime)
+    }
+    fn create_folder(&self, parent: &Node, name: &str) -> Result<()> {
+        (**self).create_folder(parent, name)
+    }
+    fn delete(&self, node: &Node, mode: DeleteMode) -> Result<()> {
+        (**self).delete(node, mode)
+    }
+    fn rename(&self, node: &Node, new_name: &str) -> Result<()> {
+        (**self).rename(node, new_name)
+    }
+    fn move_to(&self, node: &Node, destination: &Node) -> Result<()> {
+        (**self).move_to(node, destination)
+    }
+}
+
 /// [`Drive`] over Apple's web API.
 pub struct HttpDrive {
     session: Arc<Session>,

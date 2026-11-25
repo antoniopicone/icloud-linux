@@ -60,6 +60,7 @@ impl Engine {
                 return Ok(());
             }
         }
+        self.require_session()?;
         if !force && let Some(why) = self.recent_listing_failure(path) {
             return Err(crate::Error::Setup(format!("listing {path} failed a moment ago: {why}")));
         }
@@ -306,6 +307,7 @@ impl Engine {
             if inner.stop.is_raised() {
                 return Err(crate::Error::Setup("interrupted".into()));
             }
+            self.require_session()?;
             folders += 1;
             let children = match inner.drive.children(&folder) {
                 Ok(children) => children,
@@ -427,6 +429,10 @@ impl Engine {
         sync_event!(info, "lazy-refresh-start", folders = folders.len());
         for folder in folders {
             if self.inner.stop.is_raised() {
+                break;
+            }
+            if self.auth_lost() {
+                tracing::warn!("lazy refresh stopped: the iCloud session is no longer valid");
                 break;
             }
             if let Err(err) = self.list_directory(&folder, true) {
@@ -648,6 +654,19 @@ mod tests {
         rig.drive.set_outage(Some(Outage::SessionExpired));
         let _ = rig.engine.list_directory(&IcPath::root(), false);
         assert!(rig.engine.auth_lost());
+    }
+
+    #[test]
+    fn once_the_session_is_lost_listings_and_refreshes_stay_off_the_network() {
+        let rig = seeded();
+        rig.engine.list_directory(&IcPath::root(), false).unwrap();
+        rig.drive.set_outage(Some(Outage::SessionExpired));
+        assert!(rig.engine.list_directory(&IcPath::root(), true).unwrap_err().is_auth());
+        let asked = rig.drive.calls().len();
+
+        assert!(rig.engine.list_directory(&IcPath::root(), true).unwrap_err().is_auth());
+        rig.engine.run_refresh("test", true);
+        assert_eq!(rig.drive.calls().len(), asked, "iCloud is not asked again");
     }
 
     #[test]

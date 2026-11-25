@@ -5,16 +5,14 @@ use std::process::ExitCode;
 use clap::Parser;
 use icloud_core::{Layout, setup::RealSystemctl};
 use icloudctl::{
-    cli::{Cli, Command},
+    cli::Cli,
     commands::{Context, run},
     prompt::Terminal,
 };
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let debug = cli.verbose
-        || matches!(cli.command, Command::Auth { debug: true, .. })
-        || std::env::var("ICLOUD_LOG").is_ok_and(|v| v.eq_ignore_ascii_case("debug"));
+    let debug = cli.verbose || std::env::var("ICLOUD_LOG").is_ok_and(|v| v.eq_ignore_ascii_case("debug"));
     let level = if debug { tracing::Level::DEBUG } else { tracing::Level::WARN };
     tracing_subscriber::fmt().with_max_level(level).with_writer(std::io::stderr).init();
 
