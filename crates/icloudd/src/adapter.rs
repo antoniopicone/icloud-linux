@@ -7,6 +7,9 @@
 use std::{
     collections::HashMap,
     ffi::OsStr,
+    fs::File,
+    io,
+    os::unix::fs::FileExt,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
@@ -31,6 +34,11 @@ const BLOCK: u64 = 512;
 pub struct IcloudFs {
     core: Arc<FsCore>,
     inodes: Mutex<InodeTable>,
+    /// Open backing files for hydrated file handles, so `read` serves chunks
+    /// with a direct `pread` instead of hitting `SQLite` and re-opening the
+    /// mirror file on every 128 KiB request.
+    open_files: Mutex<HashMap<u64, Arc<File>>>,
+    next_fh: AtomicU64,
     /// Directory listings taken at `opendir`, so paging through a large
     /// folder lists it once rather than once per page.
     listings: Mutex<HashMap<u64, Arc<Vec<DirItem>>>>,
@@ -91,8 +99,21 @@ impl IcloudFs {
         Self {
             core,
             inodes: Mutex::new(InodeTable::new()),
+            open_files: Mutex::new(HashMap::new()),
+            next_fh: AtomicU64::new(1),
             listings: Mutex::new(HashMap::new()),
             next_listing: AtomicU64::new(1),
+        }
+    }
+
+    fn open_handle(&self, path: &IcPath) -> FileHandle {
+        match File::open(self.core.mirror_path(path)) {
+            Ok(file) => {
+                let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+                lock(&self.open_files).insert(fh, Arc::new(file));
+                FileHandle(fh)
+            }
+            Err(_) => FileHandle(0),
         }
     }
 
@@ -264,9 +285,14 @@ impl Filesystem for IcloudFs {
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let for_write = flags.acc_mode() != OpenAccMode::O_RDONLY;
+        let truncate = flags.0 & libc_o_trunc() != 0;
         let who = ProcessReader::new(req.pid());
-        match self.path_of(ino).and_then(|path| self.core.open_as(&path, for_write, &who).map_err(errno)) {
-            Ok(()) => reply.opened(FileHandle(0), FopenFlags::empty()),
+        let result = self.path_of(ino).and_then(|path| {
+            self.core.open_as_with_truncate(&path, for_write, truncate, &who).map_err(errno)?;
+            Ok(self.open_handle(&path))
+        });
+        match result {
+            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
             Err(err) => reply.error(err),
         }
     }
@@ -275,13 +301,23 @@ impl Filesystem for IcloudFs {
         &self,
         req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         size: u32,
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
+        if fh.0 != 0
+            && let Some(file) = lock(&self.open_files).get(&fh.0).cloned()
+        {
+            match read_from_file(&file, offset, size as usize) {
+                Ok(data) => return reply.data(&data),
+                Err(err) => {
+                    return reply.error(Errno::from_i32(err.raw_os_error().unwrap_or(Errno::EIO.code())));
+                }
+            }
+        }
         let who = ProcessReader::new(req.pid());
         let result =
             self.path_of(ino).and_then(|path| self.core.read_as(&path, offset, size as usize, &who).map_err(errno));
@@ -289,6 +325,22 @@ impl Filesystem for IcloudFs {
             Ok(data) => reply.data(&data),
             Err(err) => reply.error(err),
         }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if fh.0 != 0 {
+            lock(&self.open_files).remove(&fh.0);
+        }
+        reply.ok();
     }
 
     fn write(
@@ -331,10 +383,12 @@ impl Filesystem for IcloudFs {
     ) {
         let result = self.child_path(parent, name).and_then(|path| {
             self.core.create(&path, mode).map_err(errno)?;
-            self.attr_of(&path)
+            let attr = self.attr_of(&path)?;
+            let fh = self.open_handle(&path);
+            Ok((attr, fh))
         });
         match result {
-            Ok(attr) => reply.created(&TTL, &attr, Generation(0), FileHandle(0), FopenFlags::empty()),
+            Ok((attr, fh)) => reply.created(&TTL, &attr, Generation(0), fh, FopenFlags::empty()),
             Err(err) => reply.error(err),
         }
     }
@@ -442,12 +496,29 @@ impl Filesystem for IcloudFs {
     }
 }
 
-/// `S_IFMT` and `S_IFREG`, spelled out to avoid a `libc` dependency for two constants.
+fn read_from_file(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let mut filled = 0;
+    while filled < len {
+        let n = file.read_at(&mut buf[filled..], offset + filled as u64)?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+/// `S_IFMT`, `S_IFREG` and `O_TRUNC`, spelled out to avoid a `libc` dependency for three constants.
 const fn libc_s_ifmt() -> u32 {
     0o170_000
 }
 const fn libc_s_ifreg() -> u32 {
     0o100_000
+}
+const fn libc_o_trunc() -> i32 {
+    0o1000
 }
 
 #[cfg(test)]

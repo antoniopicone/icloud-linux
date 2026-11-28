@@ -55,7 +55,12 @@ use crate::{
     policy::SyncPolicy,
     state::{Entry, SyncState, now},
 };
-use sync_util::{DelayQueue, KeyedLocks, Signal, lock};
+use sync_util::{DelayQueue, DownloadLimiter, DownloadPriority, KeyedLocks, Signal, lock};
+
+/// How many files may stream from iCloud at once for interactive opens/downloads.
+const MAX_CONCURRENT_DOWNLOADS: usize = 3;
+/// Background warm-up never takes more than one slot and yields to user opens.
+const MAX_BACKGROUND_DOWNLOADS: usize = 1;
 
 /// How a value appears in a `sync …` log line.
 pub(crate) trait Field {
@@ -148,6 +153,8 @@ pub struct EngineStats {
     pub downloads_planned: u64,
 }
 
+type HydratedHook = Arc<dyn Fn(&IcPath) + Send + Sync>;
+
 struct Inner {
     drive: Arc<dyn Drive>,
     mirror: Arc<Mirror>,
@@ -158,9 +165,9 @@ struct Inner {
     /// One holder per path at a time, for anything that changes a path's
     /// mirror content or state.
     path_locks: KeyedLocks<IcPath>,
-    /// iCloud downloads misbehave when one session downloads in parallel, so
-    /// only one file streams at a time, whoever asked for it.
-    download_gate: Mutex<()>,
+    /// Bounded concurrency for downloads: interactive opens get up to 3 slots
+    /// and always preempt background warm-up (capped at 1 slot).
+    download_limiter: DownloadLimiter,
     downloads: DelayQueue<IcPath>,
     /// Only one upload pass at a time, whoever triggers it.
     upload_lock: Mutex<()>,
@@ -177,6 +184,9 @@ struct Inner {
     root: Mutex<Option<Node>>,
     /// Set when iCloud refused a request for want of a valid session.
     auth_lost: AtomicBool,
+    /// Optional callback invoked after a remote file finishes downloading
+    /// (used by the daemon to clear stale failed-thumbnail notes).
+    on_hydrated: Mutex<Option<HydratedHook>>,
 }
 
 /// Cheap to clone; all clones drive the same engine.
@@ -207,7 +217,7 @@ impl Engine {
                 policy,
                 config,
                 path_locks: KeyedLocks::default(),
-                download_gate: Mutex::new(()),
+                download_limiter: DownloadLimiter::new(MAX_CONCURRENT_DOWNLOADS, MAX_BACKGROUND_DOWNLOADS),
                 downloads: DelayQueue::default(),
                 upload_lock: Mutex::new(()),
                 scheduled: Mutex::new(HashSet::new()),
@@ -220,8 +230,14 @@ impl Engine {
                 threads: Mutex::new(Vec::new()),
                 root: Mutex::new(None),
                 auth_lost: AtomicBool::new(false),
+                on_hydrated: Mutex::new(None),
             }),
         }
+    }
+
+    /// Register a callback run whenever a remote file finishes downloading.
+    pub fn set_on_hydrated(&self, hook: impl Fn(&IcPath) + Send + Sync + 'static) {
+        *lock(&self.inner.on_hydrated) = Some(Arc::new(hook));
     }
 
     pub fn crawl_mode(&self) -> CrawlMode {
@@ -245,6 +261,22 @@ impl Engine {
         self.inner.auth_lost.load(Ordering::Relaxed)
     }
 
+    /// Mark the session as expired (e.g. when a background renewal is refused).
+    pub fn mark_auth_lost(&self) {
+        if !self.inner.auth_lost.swap(true, Ordering::Relaxed) {
+            tracing::error!("the iCloud session is no longer valid. Run `icloudctl auth` to sign in again.");
+        }
+    }
+
+    /// Clear `auth_lost` once a renewal or freshly reloaded session succeeds,
+    /// and drop cached listing failures so folders load right away.
+    pub fn clear_auth_lost(&self) {
+        if self.inner.auth_lost.swap(false, Ordering::Relaxed) {
+            lock(&self.inner.listing_failures).clear();
+            tracing::info!("the iCloud session is valid again; resuming sync");
+        }
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.inner.stop.is_raised()
     }
@@ -266,8 +298,8 @@ impl Engine {
 
     /// Remember that a failure needs a new sign-in, if it does.
     fn note_failure(&self, err: &crate::Error) {
-        if err.is_auth() && !self.inner.auth_lost.swap(true, Ordering::Relaxed) {
-            tracing::error!("the iCloud session is no longer valid. Run `icloudctl auth` to sign in again.");
+        if err.is_auth() {
+            self.mark_auth_lost();
         }
     }
 

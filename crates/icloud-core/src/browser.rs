@@ -38,7 +38,7 @@ const TRUST_COOKIE: &str = "X-APPLE-WEBAUTH-HSA-TRUST";
 /// Set together when the sign-in is complete (`accountLogin`).
 const SESSION_COOKIE: &str = "X-APPLE-WEBAUTH-TOKEN";
 const USER_COOKIE: &str = "X-APPLE-WEBAUTH-USER";
-const START_URL: &str = "https://www.icloud.com/";
+const WS_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Chromium-based browsers, by the names their packages put on `PATH`.
 const BROWSERS: &[&str] = &[
     "chromium",
@@ -106,6 +106,18 @@ impl BrowserSignIn {
     pub fn wait_for_session(&self, timeout: Duration) -> Result<Vec<BrowserCookie>> {
         wait_for_cookie(&self.ws_url, timeout)
     }
+
+    /// Wait until the browser has Apple cookies that `accept` confirms as a
+    /// verified session. Keeping the browser open during validation means a
+    /// sign-in that is still on the 2FA or "Trust this browser?" screen is
+    /// never interrupted prematurely.
+    fn wait_for_accepted_session<T>(
+        &self,
+        timeout: Duration,
+        accept: impl FnMut(&[BrowserCookie]) -> std::result::Result<T, Option<Error>>,
+    ) -> Result<T> {
+        wait_for_cookie_matching(&self.ws_url, timeout, accept)
+    }
 }
 
 /// The whole browser sign-in: open icloud.com, wait for the person to sign in,
@@ -118,24 +130,50 @@ pub fn sign_in_and_save(layout: &Layout, opened: &mut dyn FnMut()) -> Result<Acc
     let path = require_browser()?;
     let window = BrowserSignIn::start(&path)?;
     opened();
-    let cookies = window.wait_for_session(SIGN_IN_TIMEOUT)?;
-    drop(window); // close the browser before talking to Apple
 
-    // The Apple ID is not known yet, so the session starts in memory and is
-    // written under the right name once Apple has said whose it is.
-    let mut client_config = ClientConfig::new("browser-sign-in", None);
-    client_config.endpoints = connect::endpoints();
-    let client = Client::new(client_config)?;
-    client.adopt_browser_session(&cookies).map_err(|err| match err {
-        icloud_api::Error::LoginFailed(detail) => {
-            tracing::info!("{detail}");
-            Error::Setup(
-                tr("Apple did not accept the session from the browser. Try again, and choose Trust when Apple asks.")
-                    .into(),
-            )
-        }
-        other => other.into(),
-    })?;
+    // Keep the browser open while verifying the session with Apple so a user
+    // who is still finishing 2FA or clicking "Trust" does not have the window
+    // closed mid-flow.
+    let mut last_rejected: Option<Vec<BrowserCookie>> = None;
+    let mut saw_unverified = false;
+    let client = window
+        .wait_for_accepted_session(SIGN_IN_TIMEOUT, |cookies| {
+            if last_rejected.as_deref() == Some(cookies) {
+                return Err(None);
+            }
+            let mut client_config = ClientConfig::new("browser-sign-in", None);
+            client_config.endpoints = connect::endpoints();
+            let client = match Client::new(client_config) {
+                Ok(c) => c,
+                Err(err) => return Err(Some(err.into())),
+            };
+            match client.adopt_browser_session(cookies) {
+                Ok(()) => Ok(client),
+                Err(icloud_api::Error::LoginFailed(detail)) => {
+                    tracing::debug!("browser cookies not yet accepted by Apple ({detail}); keeping browser open");
+                    last_rejected = Some(cookies.to_vec());
+                    saw_unverified = true;
+                    Err(None)
+                }
+                Err(err) if err.is_transient() => {
+                    tracing::debug!("transient error verifying browser session ({err}); retrying while browser is open");
+                    Err(None)
+                }
+                Err(other) => Err(Some(other.into())),
+            }
+        })
+        .map_err(|err| {
+            if saw_unverified && err.to_string().contains("timed out") {
+                Error::Setup(
+                    tr("Apple did not accept the session from the browser. Try again, and choose Trust when Apple asks.")
+                        .into(),
+                )
+            } else {
+                err
+            }
+        })?;
+    drop(window);
+
     let info = client.account_info();
     let apple_id =
         info.apple_id.clone().filter(|id| !id.trim().is_empty()).ok_or_else(|| {
@@ -199,7 +237,7 @@ fn spawn(browser: &Path, profile: &Path) -> Result<Child> {
         // drivers it is what hangs the GPU.
         .arg("--disable-gpu-rasterization")
         .args(extra_args())
-        .arg(START_URL)
+        .arg(format!("{}/", connect::endpoints().home.trim_end_matches('/')))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -240,22 +278,48 @@ fn parse_active_port(text: &str) -> Option<String> {
 }
 
 fn wait_for_cookie(ws_url: &str, timeout: Duration) -> Result<Vec<BrowserCookie>> {
+    wait_for_cookie_matching(ws_url, timeout, |cookies| Ok(cookies.to_vec()))
+}
+
+fn wait_for_cookie_matching<T>(
+    ws_url: &str,
+    timeout: Duration,
+    mut accept: impl FnMut(&[BrowserCookie]) -> std::result::Result<T, Option<Error>>,
+) -> Result<T> {
     let deadline = Instant::now() + timeout;
     let (mut socket, _) =
         tungstenite::connect(ws_url).map_err(|err| Error::Setup(trf("could not talk to the browser: {}", &[&err])))?;
+    if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_mut() {
+        let _ = tcp.set_read_timeout(Some(WS_READ_TIMEOUT));
+    }
     let closed = || Error::Setup(tr("the browser was closed before the sign-in finished").into());
     for id in 1_u64.. {
         let request = json!({"id": id, "method": "Storage.getCookies"});
         socket.send(tungstenite::Message::text(request.to_string())).map_err(|_| closed())?;
         loop {
-            let message = socket.read().map_err(|_| closed())?;
+            let message = match socket.read() {
+                Ok(msg) => msg,
+                Err(tungstenite::Error::Io(ref err))
+                    if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(Error::Setup(tr("timed out waiting for the sign-in in the browser").into()));
+                    }
+                    continue;
+                }
+                Err(_) => return Err(closed()),
+            };
             let tungstenite::Message::Text(text) = message else { continue };
             let Ok(reply) = serde_json::from_str::<Value>(&text) else { continue };
             if reply.get("id").and_then(Value::as_u64) != Some(id) {
                 continue; // an event, or the answer to something else
             }
             if let Some(cookies) = signed_in_cookies(&reply) {
-                return Ok(cookies);
+                match accept(&cookies) {
+                    Ok(done) => return Ok(done),
+                    Err(Some(err)) => return Err(err),
+                    Err(None) => {}
+                }
             }
             break;
         }
@@ -269,7 +333,9 @@ fn wait_for_cookie(ws_url: &str, timeout: Duration) -> Result<Vec<BrowserCookie>
 
 fn is_apple_domain(domain: &str) -> bool {
     let host = domain.trim_start_matches('.');
-    ["icloud.com", "apple.com", "icloud-content.com"].iter().any(|d| host == *d || host.ends_with(&format!(".{d}")))
+    ["icloud.com", "icloud.com.cn", "apple.com", "icloud-content.com"]
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
 }
 
 /// The Apple cookies in a `Storage.getCookies` reply, once the sign-in is

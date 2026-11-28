@@ -146,6 +146,83 @@ impl<T: Ord> DelayQueue<T> {
     }
 }
 
+/// Whether a download was requested by a person opening/downloading a file or
+/// by a background warm-up worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DownloadPriority {
+    Interactive,
+    Background,
+}
+
+#[derive(Debug)]
+struct LimiterState {
+    active_interactive: usize,
+    active_background: usize,
+    waiting_interactive: usize,
+}
+
+/// Bounded concurrency for downloads, prioritising interactive user requests
+/// over background warm-up so a large background file never blocks a file a
+/// person just double-clicked, and multiple small user files download together.
+#[derive(Debug)]
+pub(super) struct DownloadLimiter {
+    max_total: usize,
+    max_background: usize,
+    state: Mutex<LimiterState>,
+    changed: Condvar,
+}
+
+pub(super) struct DownloadPermit<'a> {
+    limiter: &'a DownloadLimiter,
+    priority: DownloadPriority,
+}
+
+impl DownloadLimiter {
+    pub(super) fn new(max_total: usize, max_background: usize) -> Self {
+        Self {
+            max_total: max_total.max(1),
+            max_background: max_background.max(1),
+            state: Mutex::new(LimiterState { active_interactive: 0, active_background: 0, waiting_interactive: 0 }),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub(super) fn acquire(&self, priority: DownloadPriority) -> DownloadPermit<'_> {
+        let mut state = lock(&self.state);
+        match priority {
+            DownloadPriority::Interactive => {
+                state.waiting_interactive += 1;
+                while state.active_interactive + state.active_background >= self.max_total {
+                    state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+                }
+                state.waiting_interactive -= 1;
+                state.active_interactive += 1;
+            }
+            DownloadPriority::Background => {
+                while state.waiting_interactive > 0
+                    || state.active_background >= self.max_background
+                    || state.active_interactive + state.active_background >= self.max_total
+                {
+                    state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+                }
+                state.active_background += 1;
+            }
+        }
+        DownloadPermit { limiter: self, priority }
+    }
+}
+
+impl Drop for DownloadPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.limiter.state);
+        match self.priority {
+            DownloadPriority::Interactive => state.active_interactive -= 1,
+            DownloadPriority::Background => state.active_background -= 1,
+        }
+        self.limiter.changed.notify_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -242,5 +319,30 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         queue.close();
         assert_eq!(consumer.join().unwrap(), None);
+    }
+
+    #[test]
+    fn download_limiter_allows_parallel_interactive_and_caps_background() {
+        let limiter = Arc::new(DownloadLimiter::new(3, 1));
+        let p1 = limiter.acquire(DownloadPriority::Interactive);
+        let p2 = limiter.acquire(DownloadPriority::Interactive);
+        let bg = limiter.acquire(DownloadPriority::Background);
+
+        // A 4th permit must wait until one is dropped.
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter = {
+            let limiter = Arc::clone(&limiter);
+            let entered = Arc::clone(&entered);
+            thread::spawn(move || {
+                let _p = limiter.acquire(DownloadPriority::Interactive);
+                entered.store(true, Ordering::SeqCst);
+            })
+        };
+        thread::sleep(Duration::from_millis(20));
+        assert!(!entered.load(Ordering::SeqCst));
+        drop(bg);
+        waiter.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+        drop((p1, p2));
     }
 }

@@ -179,15 +179,20 @@ impl Mirror {
 
     /// A sparse file of the right size and time standing in for content that
     /// has not been downloaded. It takes no disk space.
+    ///
+    /// Created in `tmp` and renamed into place atomically so any process that
+    /// currently has an open handle to a previously hydrated version keeps
+    /// reading the old inode instead of suddenly seeing zeros.
     pub fn materialize_placeholder(&self, path: &IcPath, size: u64, mtime: i64) -> io::Result<()> {
         self.ensure_parent(path)?;
         let local = self.local_path(path);
         if fs::symlink_metadata(&local).is_ok_and(|m| m.is_dir()) {
             fs::remove_dir_all(&local)?;
         }
-        let file = File::create(&local)?;
-        file.set_len(size)?;
-        set_mtime_of(&file, mtime)
+        let tmp = tempfile::NamedTempFile::new_in(&self.tmp)?;
+        tmp.as_file().set_len(size)?;
+        set_mtime_of(tmp.as_file(), mtime)?;
+        tmp.persist(&local).map(drop).map_err(|e| e.error)
     }
 
     /// Write everything `source` yields to `path`, atomically. Returns the
@@ -204,8 +209,19 @@ impl Mirror {
     /// destination is still wanted before [`commit`](Self::commit)ting, which
     /// matters when the read takes minutes.
     pub fn stage_stream(&self, source: &mut dyn Read, mtime: Option<i64>) -> io::Result<Staged> {
+        self.stage_stream_with_progress(source, mtime, |_| {})
+    }
+
+    /// Like [`stage_stream`](Self::stage_stream), invoking `on_progress` with
+    /// the cumulative bytes copied after each chunk.
+    pub fn stage_stream_with_progress(
+        &self,
+        source: &mut dyn Read,
+        mtime: Option<i64>,
+        on_progress: impl FnMut(u64),
+    ) -> io::Result<Staged> {
         let mut tmp = tempfile::NamedTempFile::new_in(&self.tmp)?;
-        let (bytes, sha256) = copy_chunked(source, tmp.as_file_mut())?;
+        let (bytes, sha256) = copy_chunked(source, tmp.as_file_mut(), on_progress)?;
         if let Some(mtime) = mtime {
             set_mtime_of(tmp.as_file(), mtime)?;
         }
@@ -296,7 +312,7 @@ impl Mirror {
 }
 
 /// Copy `source` to `dest`, returning the byte count and the SHA-256.
-fn copy_chunked(source: &mut dyn Read, dest: &mut File) -> io::Result<(u64, String)> {
+fn copy_chunked(source: &mut dyn Read, dest: &mut File, mut on_progress: impl FnMut(u64)) -> io::Result<(u64, String)> {
     use std::io::Write as _;
 
     let mut buf = vec![0u8; COPY_CHUNK];
@@ -310,6 +326,7 @@ fn copy_chunked(source: &mut dyn Read, dest: &mut File) -> io::Result<(u64, Stri
         dest.write_all(&buf[..n])?;
         digest.update(&buf[..n]);
         total += n as u64;
+        on_progress(total);
     }
     dest.flush()?;
     Ok((total, hex(digest.finish().as_ref())))
@@ -521,5 +538,20 @@ mod tests {
         mirror.set_mtime(&p("/d"), 2_000_000).unwrap();
         assert_eq!(mirror.stat(&p("/f")).unwrap().mtime(), 1_000_000);
         assert_eq!(mirror.stat(&p("/d")).unwrap().mtime(), 2_000_000);
+    }
+
+    #[test]
+    fn materialize_placeholder_replaces_atomically_without_clobbering_open_readers() {
+        let (_dir, mirror) = mirror();
+        mirror.write_atomic_stream(&p("/doc.pdf"), &mut &b"real content"[..], Some(100)).unwrap();
+        let mut open_handle = File::open(mirror.local_path(&p("/doc.pdf"))).unwrap();
+
+        // A remote update replaces the path with a placeholder for the new version.
+        mirror.materialize_placeholder(&p("/doc.pdf"), 100, 200).unwrap();
+
+        let mut still_read = Vec::new();
+        open_handle.read_to_end(&mut still_read).unwrap();
+        assert_eq!(still_read, b"real content", "existing open handle must not turn into zeros");
+        assert_eq!(mirror.stat(&p("/doc.pdf")).unwrap().len(), 100);
     }
 }

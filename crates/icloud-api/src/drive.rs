@@ -5,11 +5,19 @@
 //! [`HttpDrive`] is a port of `pyicloud.services.drive` restricted to what the
 //! engine needs.
 
-use std::{collections::BTreeMap, fs::File, io::Read, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{self, Read},
+    sync::{Arc, PoisonError, RwLock, RwLockReadGuard},
+    thread,
+    time::Duration,
+};
 
 use reqwest::{
+    StatusCode,
     blocking::multipart::{Form, Part},
-    header::CONTENT_TYPE,
+    header::{CONTENT_RANGE, CONTENT_TYPE, RANGE},
 };
 use serde_json::{Value, json};
 
@@ -25,7 +33,11 @@ const VALIDATE_COOKIE: &str = "X-APPLE-WEBAUTH-VALIDATE";
 /// Apple answers a folder listing in one piece, however many items it holds,
 /// and for a folder of thousands of items that can take much longer than an
 /// ordinary request. Giving up early would leave the folder unlisted.
-const LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const LISTING_TIMEOUT: Duration = Duration::from_secs(300);
+/// Retries for transient errors when looking up a file's download URL.
+const MAX_LOOKUP_RETRIES: usize = 2;
+/// Retries (with HTTP `Range` resumption) when a download stream drops mid-way.
+const MAX_STREAM_RETRIES: usize = 3;
 
 /// What a Drive item is. Anything that behaves like a directory is
 /// [`is_directory`](Self::is_directory).
@@ -206,12 +218,36 @@ impl<D: Drive + ?Sized> Drive for std::sync::Arc<D> {
     }
 }
 
+/// Shared, dynamically-updatable endpoints and query parameters for Drive.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DriveEndpoints {
+    pub(crate) service_root: String,
+    pub(crate) document_root: String,
+    pub(crate) params: BTreeMap<String, String>,
+}
+
+impl DriveEndpoints {
+    pub(crate) fn new(service_root: String, document_root: String, params: BTreeMap<String, String>) -> Self {
+        Self {
+            service_root: service_root.trim_end_matches('/').to_owned(),
+            document_root: document_root.trim_end_matches('/').to_owned(),
+            params,
+        }
+    }
+
+    fn service_url(&self, endpoint: &str) -> String {
+        format!("{}/{endpoint}", self.service_root)
+    }
+
+    fn document_url(&self, zone: &str, endpoint: &str) -> String {
+        format!("{}/ws/{zone}/{endpoint}", self.document_root)
+    }
+}
+
 /// [`Drive`] over Apple's web API.
 pub struct HttpDrive {
     session: Arc<Session>,
-    service_root: String,
-    document_root: String,
-    params: BTreeMap<String, String>,
+    endpoints: Arc<RwLock<DriveEndpoints>>,
 }
 
 impl std::fmt::Debug for HttpDrive {
@@ -227,20 +263,30 @@ impl HttpDrive {
         document_root: String,
         params: BTreeMap<String, String>,
     ) -> Self {
-        Self {
+        Self::with_shared_endpoints(
             session,
-            service_root: service_root.trim_end_matches('/').to_owned(),
-            document_root: document_root.trim_end_matches('/').to_owned(),
-            params,
-        }
+            Arc::new(RwLock::new(DriveEndpoints::new(service_root, document_root, params))),
+        )
+    }
+
+    pub(crate) fn with_shared_endpoints(session: Arc<Session>, endpoints: Arc<RwLock<DriveEndpoints>>) -> Self {
+        Self { session, endpoints }
+    }
+
+    fn endpoints(&self) -> RwLockReadGuard<'_, DriveEndpoints> {
+        self.endpoints.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn service_url(&self, endpoint: &str) -> String {
-        format!("{}/{endpoint}", self.service_root)
+        self.endpoints().service_url(endpoint)
     }
 
     fn document_url(&self, zone: &str, endpoint: &str) -> String {
-        format!("{}/ws/{zone}/{endpoint}", self.document_root)
+        self.endpoints().document_url(zone, endpoint)
+    }
+
+    fn params(&self) -> BTreeMap<String, String> {
+        self.endpoints().params.clone()
     }
 
     /// POST a JSON body with Apple's default `application/json` content type.
@@ -255,19 +301,10 @@ impl HttpDrive {
     }
 
     /// [`post_body`](Self::post_body) with a time limit other than the default.
-    fn post_body_within(
-        &self,
-        url: &str,
-        content_type: &str,
-        body: &Value,
-        limit: Option<std::time::Duration>,
-    ) -> Result<Value> {
-        let mut request = self
-            .session
-            .post(url)
-            .query(&self.params)
-            .header(CONTENT_TYPE, content_type)
-            .body(serde_json::to_vec(body)?);
+    fn post_body_within(&self, url: &str, content_type: &str, body: &Value, limit: Option<Duration>) -> Result<Value> {
+        let params = self.params();
+        let mut request =
+            self.session.post(url).query(&params).header(CONTENT_TYPE, content_type).body(serde_json::to_vec(body)?);
         if let Some(limit) = limit {
             request = request.timeout(limit);
         }
@@ -275,12 +312,7 @@ impl HttpDrive {
         if response.is_empty() { Ok(Value::Null) } else { response.value() }
     }
 
-    fn item_details(
-        &self,
-        drivewsid: &str,
-        share_id: Option<&Value>,
-        limit: Option<std::time::Duration>,
-    ) -> Result<Value> {
+    fn item_details(&self, drivewsid: &str, share_id: Option<&Value>, limit: Option<Duration>) -> Result<Value> {
         let mut item = json!({ "drivewsid": drivewsid, "partialData": false });
         if let Some(share) = share_id {
             item["shareID"] = share.clone();
@@ -308,8 +340,189 @@ impl HttpDrive {
             .ok_or_else(|| Error::Protocol("cannot extract the upload token from its cookie".into()))
     }
 
-    fn client_id(&self) -> &str {
-        self.params.get("clientId").map_or("", String::as_str)
+    fn client_id(&self) -> String {
+        self.endpoints().params.get("clientId").cloned().unwrap_or_default()
+    }
+}
+
+/// Ask `docws` for the signed content URL of `docwsid`, retrying briefly on
+/// transient errors.
+fn resolve_download_url(
+    session: &Session,
+    endpoints: &RwLock<DriveEndpoints>,
+    zone: &str,
+    docwsid: &str,
+) -> Result<String> {
+    let mut attempt = 0;
+    loop {
+        let (lookup_url, mut params) = {
+            let ep = endpoints.read().unwrap_or_else(PoisonError::into_inner);
+            (ep.document_url(zone, "download/by_id"), ep.params.clone())
+        };
+        params.insert("document_id".into(), docwsid.to_owned());
+        let lookup = session.get(&lookup_url).query(&params);
+        match session.send(lookup).and_then(|resp| resp.value()) {
+            Ok(reply) => {
+                return ["data_token", "package_token"]
+                    .iter()
+                    .find_map(|key| reply.get(*key)?.get("url")?.as_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::Protocol("download reply has neither data_token nor package_token".into()));
+            }
+            Err(err) if err.is_transient() && attempt < MAX_LOOKUP_RETRIES => {
+                attempt += 1;
+                let wait = Duration::from_millis(400 * (1u64 << (attempt - 1)));
+                tracing::debug!("download lookup failed ({err}); retrying in {}ms", wait.as_millis());
+                thread::sleep(wait);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn open_content_stream(
+    session: &Session,
+    endpoints: &RwLock<DriveEndpoints>,
+    url: &str,
+    offset: u64,
+    expected_len: u64,
+) -> Result<reqwest::blocking::Response> {
+    let params = endpoints.read().unwrap_or_else(PoisonError::into_inner).params.clone();
+    let mut request = session.stream_get(url).query(&params);
+    if offset > 0 {
+        request = request.header(RANGE, format!("bytes={offset}-"));
+    }
+    session.send_stream(request, expected_len)
+}
+
+/// Derive a `docwsid` from a canonical `FILE::<zone>::<id>` `drivewsid` when
+/// Apple omitted the separate `docwsid` field.
+fn docwsid_from_drivewsid(drivewsid: &str) -> Option<&str> {
+    let mut parts = drivewsid.split("::");
+    let kind = parts.next()?;
+    let _zone = parts.next()?;
+    let id = parts.next()?;
+    (kind == "FILE" && parts.next().is_none() && !id.is_empty()).then_some(id)
+}
+
+/// True when a `Content-Range` header (`bytes START-END/TOTAL`) begins at `offset`.
+fn content_range_starts_at(headers: &reqwest::header::HeaderMap, offset: u64) -> bool {
+    let Some(raw) = headers.get(CONTENT_RANGE).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some(rest) = raw.trim().strip_prefix("bytes ") else { return false };
+    let Some((start, _)) = rest.split_once('-') else { return false };
+    start.trim().parse::<u64>().ok() == Some(offset)
+}
+
+/// Streams a downloaded file while verifying `Content-Length` and transparently
+/// resuming via HTTP `Range` (and refreshing expired signed URLs) if the
+/// connection stalls or drops mid-transfer.
+struct ResumingDownloadReader {
+    session: Arc<Session>,
+    endpoints: Arc<RwLock<DriveEndpoints>>,
+    zone: String,
+    docwsid: String,
+    url: String,
+    reader: reqwest::blocking::Response,
+    bytes_read: u64,
+    expected_len: Option<u64>,
+    announced_len: u64,
+    retries: usize,
+}
+
+impl ResumingDownloadReader {
+    fn new(
+        session: Arc<Session>,
+        endpoints: Arc<RwLock<DriveEndpoints>>,
+        zone: String,
+        docwsid: String,
+        url: String,
+        reader: reqwest::blocking::Response,
+        announced_len: u64,
+    ) -> Self {
+        let expected_len = reader.content_length();
+        Self { session, endpoints, zone, docwsid, url, reader, bytes_read: 0, expected_len, announced_len, retries: 0 }
+    }
+
+    fn resume_after(&mut self, cause: &str) -> io::Result<()> {
+        if self.retries >= MAX_STREAM_RETRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("download failed after {} retries at byte {}: {cause}", self.retries, self.bytes_read),
+            ));
+        }
+        let backoff = Duration::from_millis(400 * (1u64 << self.retries));
+        self.retries += 1;
+        tracing::warn!(
+            "download stream interrupted at byte {} ({cause}); resuming (attempt {}/{MAX_STREAM_RETRIES}) in {}ms",
+            self.bytes_read,
+            self.retries,
+            backoff.as_millis()
+        );
+        thread::sleep(backoff);
+
+        let response =
+            match open_content_stream(&self.session, &self.endpoints, &self.url, self.bytes_read, self.announced_len) {
+                Ok(resp) => resp,
+                Err(err) if matches!(err, Error::Status { status: 401 | 403 | 410, .. }) || err.is_transient() => {
+                    // Signed CDN URL may have expired or that edge node dropped;
+                    // ask `docws` for a fresh URL and resume from `bytes_read`.
+                    let fresh = resolve_download_url(&self.session, &self.endpoints, &self.zone, &self.docwsid)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    self.url = fresh;
+                    open_content_stream(&self.session, &self.endpoints, &self.url, self.bytes_read, self.announced_len)
+                        .map_err(|e| io::Error::other(e.to_string()))?
+                }
+                Err(err) => return Err(io::Error::other(err.to_string())),
+            };
+
+        if self.bytes_read == 0 {
+            if self.expected_len.is_none() {
+                self.expected_len = response.content_length();
+            }
+            self.reader = response;
+            return Ok(());
+        }
+        if response.status() == StatusCode::PARTIAL_CONTENT
+            && content_range_starts_at(response.headers(), self.bytes_read)
+        {
+            self.reader = response;
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            format!("server did not honour Range resume at byte {} (HTTP {})", self.bytes_read, response.status()),
+        ))
+    }
+}
+
+impl Read for ResumingDownloadReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.reader.read(buf) {
+                Ok(0) => {
+                    if let Some(expected) = self.expected_len
+                        && self.bytes_read < expected
+                    {
+                        self.resume_after(&format!("premature EOF after {} of {expected} bytes", self.bytes_read))?;
+                        continue;
+                    }
+                    return Ok(0);
+                }
+                Ok(n) => {
+                    self.bytes_read += n as u64;
+                    self.retries = 0;
+                    return Ok(n);
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    if self.resume_after(&err.to_string()).is_err() {
+                        return Err(err);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -336,21 +549,24 @@ impl Drive for HttpDrive {
         if file.size == 0 {
             return Ok(Box::new(std::io::empty()));
         }
-        let docwsid = file.docwsid.as_deref().ok_or_else(|| Error::Protocol("file without docwsid".into()))?;
+        let docwsid = file
+            .docwsid
+            .as_deref()
+            .or_else(|| docwsid_from_drivewsid(&file.drivewsid))
+            .ok_or_else(|| Error::Protocol("file without docwsid".into()))?;
         let zone = file.zone.as_deref().unwrap_or(CLOUD_DOCS_ZONE);
 
-        let mut params = self.params.clone();
-        params.insert("document_id".into(), docwsid.to_owned());
-        let lookup = self.session.get(&self.document_url(zone, "download/by_id")).query(&params);
-        let reply = self.session.send(lookup)?.value()?;
-
-        let url = ["data_token", "package_token"]
-            .iter()
-            .find_map(|key| reply.get(*key)?.get("url")?.as_str())
-            .ok_or_else(|| Error::Protocol("download reply has neither data_token nor package_token".into()))?;
-
-        let response = self.session.send_stream(self.session.get(url).query(&self.params), file.size)?;
-        Ok(Box::new(response))
+        let url = resolve_download_url(&self.session, &self.endpoints, zone, docwsid)?;
+        let response = open_content_stream(&self.session, &self.endpoints, &url, 0, file.size)?;
+        Ok(Box::new(ResumingDownloadReader::new(
+            Arc::clone(&self.session),
+            Arc::clone(&self.endpoints),
+            zone.to_owned(),
+            docwsid.to_owned(),
+            url,
+            response,
+            file.size,
+        )))
     }
 
     fn upload(&self, parent: &Node, name: &str, source: File, mtime: i64) -> Result<()> {
@@ -360,7 +576,7 @@ impl Drive for HttpDrive {
         let size = source.metadata()?.len();
 
         // 1. Ask where to put the bytes.
-        let mut params = self.params.clone();
+        let mut params = self.params();
         params.insert("token".into(), self.upload_token()?);
         let content_type = mime_guess::from_path(name).first_raw().unwrap_or("");
         let request = self

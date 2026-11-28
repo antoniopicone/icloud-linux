@@ -287,6 +287,19 @@ impl FsCore {
     /// [`open`](Self::open) on behalf of `who`, which decides whether a file
     /// that is not local may be downloaded for it.
     pub fn open_as(&self, path: &IcPath, for_write: bool, who: &dyn Requester) -> FsResult<()> {
+        self.open_as_with_truncate(path, for_write, false, who)
+    }
+
+    /// Like [`open_as`](Self::open_as), skipping the download of an existing
+    /// placeholder when `truncate` (`O_TRUNC`) is set for a write open, since
+    /// the caller is about to replace all of its bytes anyway.
+    pub fn open_as_with_truncate(
+        &self,
+        path: &IcPath,
+        for_write: bool,
+        truncate: bool,
+        who: &dyn Requester,
+    ) -> FsResult<()> {
         if Mirror::is_reserved(path) {
             return Err(Errno::NOENT);
         }
@@ -299,7 +312,18 @@ impl FsCore {
         if entry.is_directory() {
             return Err(Errno::ISDIR);
         }
+        if for_write && truncate && !entry.hydrated {
+            self.mirror.truncate(path, 0).map_err(|e| log_io("open", path, &e))?;
+            self.record_content_change("open", path, true)?;
+            return Ok(());
+        }
         self.ensure_content(path, &entry, who)
+    }
+
+    /// The path in the local mirror, for callers that hold an open backing file
+    /// handle once [`open_as_with_truncate`](Self::open_as_with_truncate) succeeds.
+    pub fn mirror_path(&self, path: &IcPath) -> std::path::PathBuf {
+        self.mirror.local_path(path)
     }
 
     /// Make sure a file's bytes are in the mirror before they are read or
@@ -309,7 +333,7 @@ impl FsCore {
     /// `EACCES` (a thumbnailer is let through for small files), so browsing a
     /// folder never turns into downloading it.
     fn ensure_content(&self, path: &IcPath, entry: &Entry, who: &dyn Requester) -> FsResult<()> {
-        if entry.hydrated || entry.remote_drivewsid.is_none() {
+        if (entry.hydrated && self.mirror.exists(path)) || entry.remote_drivewsid.is_none() {
             return Ok(());
         }
         let reader = who.reader();
@@ -447,7 +471,11 @@ impl FsCore {
             if entry.is_directory() {
                 return Err(Errno::ISDIR);
             }
-            self.ensure_content(path, entry, &Reader::Person)?;
+            // Truncating to 0 discards all existing bytes; no need to download
+            // an unhydrated placeholder from iCloud first.
+            if len > 0 {
+                self.ensure_content(path, entry, &Reader::Person)?;
+            }
         }
         self.mirror.truncate(path, len).map_err(|e| log_io("truncate", path, &e))?;
         self.record_content_change("truncate", path, entry.is_some())
@@ -1393,5 +1421,22 @@ mod tests {
         assert_eq!(rig.drive.contents("/Projects/top.txt").unwrap(), b"top content");
         assert!(!rig.drive.exists("/top.txt") && !rig.drive.exists("/Empty"));
         assert!(rig.engine.state().list_dirty_entries().unwrap().is_empty(), "everything is in sync");
+    }
+
+    #[test]
+    fn truncate_to_zero_and_open_trunc_do_not_download_unhydrated_placeholders() {
+        let rig = Rig::seeded();
+        rig.names("/");
+        rig.names("/Docs");
+
+        rig.fs.truncate(&p("/top.txt"), 0).unwrap();
+        assert_eq!(rig.drive.calls_matching("open:"), 0, "truncating to 0 must not download the old file");
+        assert!(rig.entry("/top.txt").unwrap().hydrated);
+        assert!(rig.entry("/top.txt").unwrap().dirty);
+
+        rig.fs.open_as_with_truncate(&p("/Docs/a.txt"), true, true, &Reader::Person).unwrap();
+        assert_eq!(rig.drive.calls_matching("open:"), 0, "O_TRUNC open must not download the old file");
+        assert!(rig.entry("/Docs/a.txt").unwrap().hydrated);
+        assert!(rig.entry("/Docs/a.txt").unwrap().dirty);
     }
 }

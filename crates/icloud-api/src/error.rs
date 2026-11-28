@@ -71,4 +71,29 @@ impl Error {
     pub fn is_auth(&self) -> bool {
         matches!(self, Self::AuthRequired(_) | Self::LoginFailed(_))
     }
+
+    /// True for transport failures, rate limiting, and temporary server errors
+    /// where retrying after a short wait may succeed.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Http(_) | Self::Io(_) => true,
+            Self::Status { status, .. } => *status == 408 || *status == 429 || (500..=599).contains(status),
+            Self::Api { code, .. } => matches!(
+                code.as_deref(),
+                Some("408" | "429" | "500" | "502" | "503" | "504" | "ACCESS_DENIED" | "SERVICE_UNAVAILABLE")
+            ),
+            _ => false,
+        }
+    }
+
+    /// True when a Drive error may mean the web session lapsed and renewing it
+    /// is worth trying before giving up.
+    pub fn may_be_session_expired(&self) -> bool {
+        match self {
+            Self::AuthRequired(_) => true,
+            Self::Status { status, .. } => matches!(status, 401 | 421 | 450),
+            Self::Api { code, .. } => matches!(code.as_deref(), Some("401" | "421" | "450")),
+            _ => false,
+        }
+    }
 }

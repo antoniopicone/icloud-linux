@@ -6,6 +6,12 @@ use super::*;
 /// Give up waiting for a stable answer after this many attempts to hydrate a
 /// file that keeps changing under us.
 const MAX_HYDRATE_ATTEMPTS: usize = 3;
+/// Interactive download retries on transient transport/server failures.
+const MAX_DOWNLOAD_RETRIES: usize = 3;
+/// Emit `hydrate-progress` events at most this often during large downloads.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+/// Only emit progress events for files at least this large (512 KiB).
+const PROGRESS_MIN_BYTES: u64 = 512 * 1024;
 
 impl Engine {
     /// Make sure the contents of `path` are in the mirror, downloading them if
@@ -13,6 +19,10 @@ impl Engine {
     /// and for files that are already local; the caller must not assume the
     /// file is hydrated afterwards (use [`hydrate`](Self::hydrate) for that).
     pub fn ensure_local_file(&self, path: &IcPath) -> Result<()> {
+        self.ensure_local_file_with_priority(path, DownloadPriority::Interactive)
+    }
+
+    fn ensure_local_file_with_priority(&self, path: &IcPath, priority: DownloadPriority) -> Result<()> {
         let inner = &self.inner;
         if !inner.policy.allows(path) {
             return Ok(());
@@ -33,7 +43,7 @@ impl Engine {
             return Ok(());
         }
 
-        let Some(node) = entry.node() else {
+        let Some(mut node) = entry.node() else {
             // Created here, never on iCloud: whatever is in the mirror is the file.
             inner.mirror.create_file(path)?;
             let checksum = inner.mirror.sha256(path)?;
@@ -45,14 +55,59 @@ impl Engine {
 
         self.require_session()?;
         sync_event!(info, "hydrate-start", path = path, drivewsid = node.drivewsid, size = node.size);
-        let staged = {
-            let _gate = lock(&inner.download_gate);
-            let mut reader = inner.drive.open(&node).map_err(|err| {
-                let err = crate::Error::from(err);
-                self.note_failure(&err);
-                err
-            })?;
-            inner.mirror.stage_stream(&mut reader, Some(entry.mtime))?
+
+        let max_attempts = match priority {
+            DownloadPriority::Interactive => MAX_DOWNLOAD_RETRIES,
+            // Background warm-up has its own exponential backoff queue.
+            DownloadPriority::Background => 1,
+        };
+        let mut refreshed_meta = false;
+        let mut attempt = 0usize;
+        let staged = loop {
+            attempt += 1;
+            let outcome = {
+                let _permit = inner.download_limiter.acquire(priority);
+                self.fetch_staged(path, &node, entry.mtime)
+            };
+            match outcome {
+                Ok(staged) => break staged,
+                Err(err) => {
+                    self.note_failure(&err);
+                    if err.is_auth() || inner.stop.is_raised() {
+                        sync_event!(warn, "hydrate-failed", path = path);
+                        return Err(err);
+                    }
+                    // A 404 on `download/by_id` can mean the file was replaced
+                    // on another device with a new docwsid since this folder
+                    // was listed: refresh its node metadata once and retry.
+                    if !refreshed_meta
+                        && matches!(err, crate::Error::Api(icloud_api::Error::Status { status: 404, .. }))
+                    {
+                        refreshed_meta = true;
+                        if let Ok(fresh) = inner.drive.node(&node.drivewsid, node.share_id.as_ref())
+                            && fresh.docwsid != node.docwsid
+                        {
+                            tracing::info!("{path}: refreshed stale remote metadata before retrying download");
+                            node = fresh;
+                            continue;
+                        }
+                    }
+                    if attempt < max_attempts && is_retryable_download_error(&err) {
+                        let wait = Duration::from_millis(400 * (1u64 << (attempt - 1)));
+                        tracing::warn!(
+                            "download of {path} failed (attempt {attempt}/{max_attempts}): {err}; retrying in {}ms",
+                            wait.as_millis()
+                        );
+                        if inner.stop.wait(wait) {
+                            sync_event!(warn, "hydrate-failed", path = path);
+                            return Err(err);
+                        }
+                        continue;
+                    }
+                    sync_event!(warn, "hydrate-failed", path = path);
+                    return Err(err);
+                }
+            }
         };
         if node.size != 0 && staged.len() != node.size {
             tracing::warn!("{path}: iCloud announced {} bytes but sent {}", node.size, staged.len());
@@ -76,8 +131,25 @@ impl Engine {
         inner.mirror.commit(staged, path)?;
         let stats = inner.mirror.stat(path)?;
         inner.state.mark_hydrated(path, Some(&checksum), Some(stats.len()), Some(mtime_of(&stats)))?;
+        if let Some(hook) = lock(&inner.on_hydrated).clone() {
+            hook(path);
+        }
         sync_event!(info, "hydrate-complete", path = path, source = "remote", size = stats.len());
         Ok(())
+    }
+
+    fn fetch_staged(&self, path: &IcPath, node: &Node, mtime: i64) -> Result<crate::mirror::Staged> {
+        let inner = &self.inner;
+        let mut reader = inner.drive.open(node).map_err(crate::Error::from)?;
+        let total = node.size;
+        let mut last_report = Instant::now();
+        let staged = inner.mirror.stage_stream_with_progress(&mut reader, Some(mtime), |bytes| {
+            if total >= PROGRESS_MIN_BYTES && last_report.elapsed() >= PROGRESS_INTERVAL {
+                sync_event!(info, "hydrate-progress", path = path, bytes = bytes, total = total);
+                last_report = Instant::now();
+            }
+        })?;
+        Ok(staged)
     }
 
     /// Like [`ensure_local_file`](Self::ensure_local_file), but guarantees the
@@ -142,7 +214,7 @@ impl Engine {
         let inner = &self.inner;
         let mut retry: Option<Duration> = None;
 
-        match self.ensure_local_file(path) {
+        match self.ensure_local_file_with_priority(path, DownloadPriority::Background) {
             Ok(()) => {
                 lock(&inner.attempts).remove(path);
                 sync_event!(info, "download-complete", path = path);
@@ -177,6 +249,14 @@ impl Engine {
         if let Some(delay) = retry {
             self.schedule_download_after(path, delay);
         }
+    }
+}
+
+fn is_retryable_download_error(err: &crate::Error) -> bool {
+    match err {
+        crate::Error::Io(_) => true,
+        crate::Error::Api(api) => api.is_transient(),
+        _ => false,
     }
 }
 
@@ -426,5 +506,75 @@ mod tests {
         rig.engine.schedule_all_unhydrated().unwrap();
         assert_eq!(rig.engine.stats().downloads_queued, 2);
         assert_eq!(rig.engine.stats().downloads_planned, 2);
+    }
+
+    #[test]
+    fn interactive_download_retries_transient_errors_and_invokes_hydrated_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TransientOnce {
+            inner: Arc<icloud_api::memory::MemoryDrive>,
+            attempts: AtomicUsize,
+        }
+        impl Drive for TransientOnce {
+            fn root(&self) -> icloud_api::Result<Node> {
+                self.inner.root()
+            }
+            fn node(&self, id: &str, share: Option<&serde_json::Value>) -> icloud_api::Result<Node> {
+                self.inner.node(id, share)
+            }
+            fn children(&self, folder: &Node) -> icloud_api::Result<Vec<Node>> {
+                self.inner.children(folder)
+            }
+            fn open(&self, file: &Node) -> icloud_api::Result<Box<dyn std::io::Read + Send>> {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(icloud_api::Error::Status { status: 503, reason: "Service Unavailable".into() });
+                }
+                self.inner.open(file)
+            }
+            fn upload(&self, p: &Node, n: &str, s: std::fs::File, m: i64) -> icloud_api::Result<()> {
+                self.inner.upload(p, n, s, m)
+            }
+            fn create_folder(&self, p: &Node, n: &str) -> icloud_api::Result<()> {
+                self.inner.create_folder(p, n)
+            }
+            fn delete(&self, n: &Node, m: icloud_api::DeleteMode) -> icloud_api::Result<()> {
+                self.inner.delete(n, m)
+            }
+            fn rename(&self, n: &Node, name: &str) -> icloud_api::Result<()> {
+                self.inner.rename(n, name)
+            }
+            fn move_to(&self, n: &Node, d: &Node) -> icloud_api::Result<()> {
+                self.inner.move_to(n, d)
+            }
+        }
+
+        let rig = rig_with_file();
+        let flaky = Arc::new(TransientOnce { inner: rig.drive.clone(), attempts: AtomicUsize::new(0) });
+        let engine = Engine::new(
+            flaky.clone(),
+            rig.engine.inner.mirror.clone(),
+            rig.engine.inner.state.clone(),
+            SyncPolicy::unrestricted(),
+            EngineConfig { auto_sync: false, ..EngineConfig::default() },
+        );
+        let hooked = Arc::new(Mutex::new(Vec::new()));
+        let hooked_ref = hooked.clone();
+        engine.set_on_hydrated(move |p| hooked_ref.lock().unwrap().push(p.clone()));
+
+        engine.hydrate(&Rig::path("/f.txt")).unwrap();
+        assert_eq!(flaky.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(rig.local("/f.txt"), b"remote bytes");
+        assert_eq!(*hooked.lock().unwrap(), [Rig::path("/f.txt")]);
+    }
+
+    #[test]
+    fn clearing_auth_lost_allows_downloads_to_resume() {
+        let rig = rig_with_file();
+        rig.engine.mark_auth_lost();
+        assert!(rig.engine.hydrate(&Rig::path("/f.txt")).unwrap_err().is_auth());
+        rig.engine.clear_auth_lost();
+        rig.engine.hydrate(&Rig::path("/f.txt")).unwrap();
+        assert_eq!(rig.local("/f.txt"), b"remote bytes");
     }
 }

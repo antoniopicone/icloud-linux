@@ -218,3 +218,63 @@ fn a_session_that_still_needs_a_code_is_never_resumed() {
     let err = client(&server, None).adopt_browser_session(&[browser_cookie("X-APPLE-WEBAUTH-TOKEN", "t")]).unwrap_err();
     assert!(matches!(err, Error::LoginFailed(_)), "{err:?}");
 }
+
+#[test]
+fn transient_503_during_validate_is_not_treated_as_expired_session() {
+    let server = MockServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    signed_in(&server, dir.path());
+    server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/validate");
+        then.status(503);
+    });
+    let err = client(&server, Some(dir.path())).resume().unwrap_err();
+    assert!(err.is_transient(), "503 must be transient: {err:?}");
+    assert!(!err.is_auth(), "503 must not discard a valid session: {err:?}");
+}
+
+#[test]
+fn cached_endpoints_allow_offline_drive_creation_and_later_renewal() {
+    let server = MockServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    signed_in(&server, dir.path());
+
+    // Simulate a restart where validate hasn't succeeded yet.
+    let offline = client(&server, Some(dir.path()));
+    assert!(offline.drive_from_cache().is_some(), "saved drivews/docws URLs allow offline mount");
+
+    // Once iCloud comes back, renew_session validates and runs PCS.
+    let validate = server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/validate");
+        then.status(200).header("content-type", "application/json").json_body(account_reply(true));
+    });
+    let pcs = server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/requestWebAccessState");
+        then.status(200).header("content-type", "application/json").json_body(json!({"isICDRSDisabled": false}));
+    });
+    offline.renew_session().unwrap();
+    validate.assert();
+    pcs.assert();
+}
+
+#[test]
+fn renew_session_reloads_fresh_cookies_saved_to_disk() {
+    let server = MockServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    signed_in(&server, dir.path());
+
+    let running = client(&server, Some(dir.path()));
+    // Another process signs in with a new token.
+    let mut accept_fresh = server.mock(|when, then| {
+        when.method(POST).path("/setup/ws/1/validate").header_includes("cookie", "X-APPLE-WEBAUTH-TOKEN=brand-new");
+        then.status(200).header("content-type", "application/json").json_body(account_reply(true));
+    });
+    client(&server, Some(dir.path()))
+        .adopt_browser_session(&[browser_cookie("X-APPLE-WEBAUTH-TOKEN", "brand-new")])
+        .unwrap();
+
+    // The already-running client picks up the fresh token from disk on renew.
+    running.renew_session().unwrap();
+    assert_eq!(accept_fresh.calls(), 2);
+    accept_fresh.delete();
+}

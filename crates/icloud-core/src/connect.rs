@@ -14,6 +14,10 @@ pub enum Connection {
         session: Arc<RenewingDrive<HttpDrive>>,
         /// Kept so its session can be saved on shutdown.
         client: Arc<Client>,
+        /// True when iCloud was unreachable at startup and we mounted using
+        /// cached endpoints; the session keep-alive thread should validate as
+        /// soon as the network is available.
+        started_offline: bool,
     },
     /// No usable session. The daemon still runs and serves its cache, so it
     /// does not crash-loop, which is what would trigger Apple's lockout.
@@ -49,26 +53,43 @@ pub fn client_for(config: &Config) -> Result<Client> {
 
 /// Reuse the saved session from the last sign-in on icloud.com.
 ///
-/// A network failure is returned as an error (the caller may retry later,
-/// which costs nothing); a session Apple no longer accepts comes back as
+/// A network failure at startup falls back to cached service endpoints when
+/// available so the mount still comes up immediately offline and reconnects as
+/// soon as iCloud is reachable; if no cached endpoints exist, the network error
+/// is returned to the caller. A session Apple no longer accepts comes back as
 /// [`Connection::Unauthenticated`]: only signing in again helps.
 pub fn connect(config: &Config) -> Result<Connection> {
     let client = client_for(config)?;
 
-    if let Err(err) = client.resume() {
-        if !err.is_auth() {
-            return Err(err.into());
+    let (http_drive, started_offline) = match client.resume() {
+        Ok(()) => (client.drive()?, false),
+        Err(err) if err.is_auth() => {
+            tracing::info!("the saved session cannot be reused ({err})");
+            return Ok(Connection::Unauthenticated { reason: err.to_string() });
         }
-        tracing::info!("the saved session cannot be reused ({err})");
-        return Ok(Connection::Unauthenticated { reason: err.to_string() });
-    }
+        Err(err) => {
+            if let Some(cached) = client.drive_from_cache() {
+                tracing::warn!(
+                    "could not reach iCloud at startup ({err}); mounting with cached session and will reconnect in the background"
+                );
+                (cached, true)
+            } else {
+                return Err(err.into());
+            }
+        }
+    };
 
-    // The web session lapses while the daemon runs; renew it when Drive says so.
+    // The web session lapses while the daemon runs; renew it when Drive says so,
+    // and pick up fresh cookies written to disk by `icloudctl auth`.
     let client = Arc::new(client);
     let renewer = Arc::clone(&client);
-    let session = Arc::new(RenewingDrive::new(client.drive()?, move || renewer.renew_session()));
+    let probe_client = Arc::clone(&client);
+    let session = Arc::new(
+        RenewingDrive::new(http_drive, move || renewer.renew_session())
+            .with_disk_probe(move || probe_client.session().has_newer_on_disk()),
+    );
     let drive: Arc<dyn Drive> = session.clone();
-    Ok(Connection::Ready { drive, session, client })
+    Ok(Connection::Ready { drive, session, client, started_offline })
 }
 
 #[cfg(test)]

@@ -285,3 +285,81 @@ fn api_errors_inside_a_200_reply_are_not_swallowed() {
     let err = drive.rename(&file("a", 1), "b").unwrap_err();
     assert!(err.to_string().contains("name already in use"), "{err}");
 }
+
+#[test]
+fn downloads_resume_with_http_range_after_a_premature_eof() {
+    use std::{
+        io::{BufRead, BufReader},
+        net::TcpListener,
+        thread,
+    };
+
+    let cdn = TcpListener::bind("127.0.0.1:0").unwrap();
+    let cdn_port = cdn.local_addr().unwrap().port();
+    let cdn_thread = thread::spawn(move || {
+        // First request: announce 11 bytes, send only 5, then close the socket.
+        let (mut stream, _) = cdn.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+            line.clear();
+        }
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello").unwrap();
+        drop(stream);
+
+        // Second request: must ask for `Range: bytes=5-` and gets the tail.
+        let (mut stream, _) = cdn.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut headers = String::new();
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+            headers.push_str(&line);
+            line.clear();
+        }
+        assert!(
+            headers.to_ascii_lowercase().contains("range: bytes=5-"),
+            "expected Range resume header, got:\n{headers}"
+        );
+        stream
+            .write_all(
+                b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-10/11\r\nContent-Length: 6\r\nConnection: close\r\n\r\n world",
+            )
+            .unwrap();
+    });
+
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/docws/ws/com.apple.CloudDocs/download/by_id");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({"data_token": {"url": format!("http://127.0.0.1:{cdn_port}/blob")}}));
+    });
+
+    let (drive, _) = drive(&server);
+    let mut out = String::new();
+    drive.open(&file("resumed.txt", 11)).unwrap().read_to_string(&mut out).unwrap();
+    cdn_thread.join().unwrap();
+    assert_eq!(out, "hello world");
+}
+
+#[test]
+fn downloads_derive_docwsid_from_drivewsid_when_missing() {
+    let server = MockServer::start();
+    let lookup = server.mock(|when, then| {
+        when.method(GET).path("/docws/ws/com.apple.CloudDocs/download/by_id").query_param("document_id", "FALLBACK");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({"data_token": {"url": server.url("/content/f")}}));
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/content/f");
+        then.status(200).body("ok");
+    });
+    let (drive, _) = drive(&server);
+    let mut node = file("FALLBACK", 2);
+    node.docwsid = None;
+    let mut out = String::new();
+    drive.open(&node).unwrap().read_to_string(&mut out).unwrap();
+    lookup.assert();
+    assert_eq!(out, "ok");
+}

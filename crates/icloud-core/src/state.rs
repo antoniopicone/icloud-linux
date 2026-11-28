@@ -1,6 +1,6 @@
 //! The sync state database.
 //!
-//! One SQLite file records, for every path the mirror knows, what iCloud said
+//! One `SQLite` file records, for every path the mirror knows, what iCloud said
 //! about it and what has happened to it locally since. The schema is the one
 //! the Python implementation used, so an existing database is read as it is.
 //!

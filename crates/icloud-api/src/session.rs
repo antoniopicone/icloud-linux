@@ -9,8 +9,11 @@ use std::{
     io::{self, Read},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime},
 };
 
 use reqwest::{
@@ -30,10 +33,18 @@ pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_1
 /// Total time allowed for one metadata request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Drop idle sockets promptly so a network switch or laptop sleep does not
+/// leave dead keep-alive connections sitting in the pool.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+/// Kernel-level TCP timeout for unacknowledged / stalled transfers.
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(45);
 /// Upper bound for a buffered response body. Real folder listings are a few
 /// megabytes; this only protects against a misbehaving server.
 const MAX_BODY_BYTES: u64 = 256 * 1024 * 1024;
-/// Streams get a total timeout that grows with the expected size.
+/// Uploads get a total timeout that grows with the expected size.
 const STREAM_BASE_TIMEOUT: Duration = Duration::from_secs(120);
 const STREAM_MIN_BYTES_PER_SEC: u64 = 32 * 1024;
 
@@ -41,11 +52,21 @@ pub(crate) const CT_JSON: &str = "application/json";
 pub(crate) const CT_PLAIN: &str = "plain/text";
 
 /// What is kept next to the cookies. The id iCloud's web services know this
-/// client by stays the same from one run to the next, as a browser's would.
+/// client by stays the same from one run to the next, as a browser's would,
+/// and the last known service URLs let the daemon mount offline and recover
+/// once the network returns.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drivews_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docws_url: Option<String>,
 }
 
 /// A cookie taken from a browser the person signed in with.
@@ -86,7 +107,7 @@ impl BrowserCookie {
                 return None; // already expired
             }
             line.push_str("; Max-Age=");
-            line.push_str(&(left as u64).to_string());
+            line.push_str(&(left.ceil() as u64).max(1).to_string());
         }
         if self.secure {
             line.push_str("; Secure");
@@ -134,15 +155,31 @@ impl ApiResponse {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: SystemTime,
+    len: u64,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = fs::metadata(path).ok()?;
+    Some(FileStamp { modified: meta.modified().ok()?, len: meta.len() })
+}
+
 struct Persistence {
     session_file: PathBuf,
     cookie_file: PathBuf,
     /// Last serialised form written, to skip redundant disk writes.
     last_session: Mutex<String>,
+    /// Stamp of `cookie_file` as last loaded or flushed by this process.
+    last_cookie_stamp: Mutex<Option<FileStamp>>,
 }
 
 pub struct Session {
     client: Client,
+    /// Dedicated streaming client with an inactivity read timeout and no total
+    /// transfer cap, sharing the same cookie jar and default headers.
+    stream_client: Client,
     jar: Arc<CookieStoreMutex>,
     data: Mutex<SessionData>,
     persistence: Option<Persistence>,
@@ -167,7 +204,13 @@ impl Session {
     pub fn open(account: &str, dir: Option<&Path>, home_origin: &str, new_client_id: &str) -> Result<Arc<Self>> {
         let persistence = dir.map(|dir| {
             let (session_file, cookie_file) = session_files(account, dir);
-            Persistence { session_file, cookie_file, last_session: Mutex::new(String::new()) }
+            let stamp = file_stamp(&cookie_file);
+            Persistence {
+                session_file,
+                cookie_file,
+                last_session: Mutex::new(String::new()),
+                last_cookie_stamp: Mutex::new(stamp),
+            }
         });
 
         let mut data = SessionData::default();
@@ -188,17 +231,41 @@ impl Session {
 
         let client = Client::builder()
             .user_agent(USER_AGENT)
-            .default_headers(headers)
+            .default_headers(headers.clone())
             .cookie_provider(Arc::clone(&jar))
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE)
+            .tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
+            .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
+            .tcp_user_timeout(TCP_USER_TIMEOUT)
             .build()?;
 
-        Ok(Arc::new(Self { client, jar, data: Mutex::new(data), persistence }))
+        let stream_client = Client::builder()
+            .user_agent(USER_AGENT)
+            .default_headers(headers)
+            .cookie_provider(Arc::clone(&jar))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE)
+            .tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
+            .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
+            .tcp_user_timeout(TCP_USER_TIMEOUT)
+            .build()?;
+
+        Ok(Arc::new(Self { client, stream_client, jar, data: Mutex::new(data), persistence }))
     }
 
     pub fn get(&self, url: &str) -> RequestBuilder {
         self.client.get(url)
+    }
+
+    /// GET request for a streamed download: uses a per-read inactivity timeout
+    /// instead of a fixed total timeout so large downloads are not cut off
+    /// while making progress, yet stalled sockets fail promptly.
+    pub fn stream_get(&self, url: &str) -> RequestBuilder {
+        self.stream_client.get(url)
     }
 
     pub fn post(&self, url: &str) -> RequestBuilder {
@@ -207,6 +274,12 @@ impl Session {
 
     pub fn data(&self) -> SessionData {
         lock(&self.data).clone()
+    }
+
+    /// Update the stored session metadata and persist it if it changed.
+    pub fn update_data(&self, update: impl FnOnce(&mut SessionData)) {
+        update(&mut lock(&self.data));
+        self.persist_data();
     }
 
     /// Change the session data and persist it if it changed.
@@ -243,8 +316,8 @@ impl Session {
 
     /// Send a request whose body is streamed to the caller. Failures are
     /// turned into [`Error`] using at most 64 KiB of the body.
-    pub fn send_stream(&self, request: RequestBuilder, expected_len: u64) -> Result<Response> {
-        let response = request.timeout(Self::transfer_timeout(expected_len)).send()?;
+    pub fn send_stream(&self, request: RequestBuilder, _expected_len: u64) -> Result<Response> {
+        let response = request.send()?;
         if response.status().is_success() {
             return Ok(response);
         }
@@ -266,9 +339,9 @@ impl Session {
     }
 
     /// Turn Apple's status and body conventions into a `Result`.
-    fn check(&self, response: &ApiResponse) -> Result<()> {
+    pub(crate) fn check(&self, response: &ApiResponse) -> Result<()> {
         if !(200..300).contains(&response.status) {
-            let json_or_auth = response.is_json() || matches!(response.status, 409 | 421 | 450 | 500);
+            let json_or_auth = response.is_json() || matches!(response.status, 401 | 409 | 421 | 450 | 500);
             return Err(if json_or_auth {
                 self.classify_error(response)
             } else {
@@ -299,6 +372,9 @@ impl Session {
         {
             return err;
         }
+        if response.status == 401 {
+            return Error::Status { status: 401, reason: reason_phrase(401) };
+        }
         make_api_error(Some(response.status.to_string()), reason_phrase(response.status))
     }
 
@@ -321,7 +397,54 @@ impl Session {
         let Some(p) = &self.persistence else { return Ok(()) };
         self.persist_data();
         write_private(&p.cookie_file, &self.cookie_bytes()?)?;
+        *lock(&p.last_cookie_stamp) = file_stamp(&p.cookie_file);
         Ok(())
+    }
+
+    /// True when another process (such as `icloudctl auth`) has written a newer
+    /// cookie file on disk since this session last loaded or saved it.
+    pub fn has_newer_on_disk(&self) -> bool {
+        let Some(p) = &self.persistence else { return false };
+        let Some(current) = file_stamp(&p.cookie_file) else { return false };
+        *lock(&p.last_cookie_stamp) != Some(current)
+    }
+
+    /// Reload cookies and session data from disk if another process wrote a
+    /// newer cookie file containing valid credentials. Returns whether the
+    /// in-memory session was replaced.
+    pub fn reload_from_disk_if_newer(&self) -> bool {
+        let Some(p) = &self.persistence else { return false };
+        let Some(current) = file_stamp(&p.cookie_file) else { return false };
+        if *lock(&p.last_cookie_stamp) == Some(current) {
+            return false;
+        }
+        let Some(store) = fs::File::open(&p.cookie_file)
+            .ok()
+            .and_then(|file| cookie_store::serde::json::load_all(io::BufReader::new(file)).ok())
+        else {
+            return false;
+        };
+        let has_token = store.iter_unexpired().any(|c| c.name() == "X-APPLE-WEBAUTH-TOKEN" && !c.value().is_empty());
+        if !has_token {
+            return false;
+        }
+        let disk_data = load_session_data(&p.session_file);
+        {
+            let mut jar = self.jar.lock().unwrap_or_else(PoisonError::into_inner);
+            *jar = store;
+        }
+        {
+            let mut data = lock(&self.data);
+            let fallback_client_id = data.client_id.clone();
+            *data = disk_data;
+            if data.client_id.is_none() {
+                data.client_id = fallback_client_id;
+            }
+            *lock(&p.last_session) = serde_json::to_string(&*data).unwrap_or_default();
+        }
+        *lock(&p.last_cookie_stamp) = Some(current);
+        tracing::info!("reloaded updated iCloud session from disk");
+        true
     }
 
     /// Write this session to `dir` as the saved session of `account`, where
@@ -356,6 +479,7 @@ impl Session {
                 }
             }
             lock(&p.last_session).clear();
+            *lock(&p.last_cookie_stamp) = None;
         }
     }
 
@@ -420,8 +544,8 @@ fn is_falsy(value: &Value) -> bool {
 
 fn make_api_error(code: Option<String>, reason: String) -> Error {
     // What iCloud's web services say once the session's cookies have lapsed.
-    // Unlike the generic 421 above, these name the session explicitly.
-    if reason == "Missing X-APPLE-WEBAUTH-TOKEN cookie" || reason.eq_ignore_ascii_case("Invalid global session") {
+    // Unlike the generic 421 below, these name the session explicitly.
+    if is_expired_session_reason(&reason) {
         return Error::AuthRequired(reason);
     }
     match code.as_deref() {
@@ -437,6 +561,19 @@ fn make_api_error(code: Option<String>, reason: String) -> Error {
         }
         _ => Error::Api { code, reason },
     }
+}
+
+fn is_expired_session_reason(reason: &str) -> bool {
+    let trimmed = reason.trim();
+    [
+        "Missing X-APPLE-WEBAUTH-TOKEN cookie",
+        "Missing X-APPLE-WEBAUTH-USER cookie",
+        "Invalid global session",
+        "Invalid session",
+        "Session expired",
+    ]
+    .iter()
+    .any(|known| trimmed.eq_ignore_ascii_case(known))
 }
 
 fn load_session_data(path: &Path) -> SessionData {
@@ -459,19 +596,39 @@ fn load_cookies(path: &Path) -> cookie_store::CookieStore {
     }
 }
 
+static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
 /// Write `contents` to `path` atomically with mode 0600, creating the parent
-/// directory with mode 0700.
+/// directory with mode 0700. Uses a unique temporary name so concurrent
+/// flushes of `.session` and `.cookiejar` can never collide.
 pub(crate) fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
 
-    if let Some(parent) = path.parent() {
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+    let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("session");
+    let pid = std::process::id();
+    let tmp = loop {
+        let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{base}.{pid}.{seq}.tmp"));
+        match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&candidate) {
+            Ok(mut file) => {
+                let write_res = file.write_all(contents).and_then(|()| file.sync_all());
+                if let Err(err) = write_res {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(err);
+                }
+                break candidate;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    };
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
     }
-    let tmp = path.with_extension("tmp");
-    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -607,5 +764,49 @@ mod tests {
         let session = Session::open("me.com", Some(dir.path()), "https://www.icloud.com", "cid").unwrap();
         assert_eq!(session.data().client_id.as_deref(), Some("cid"));
         assert!(!session.has_credentials());
+    }
+
+    #[test]
+    fn reloading_from_disk_picks_up_a_newer_session_written_by_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_cookie = |val: &str| BrowserCookie {
+            name: "X-APPLE-WEBAUTH-TOKEN".into(),
+            value: val.into(),
+            domain: ".icloud.com".into(),
+            path: "/".into(),
+            secure: true,
+            http_only: true,
+            expires: Some(4_102_444_800.0),
+        };
+        let first = Session::open("me@example.com", Some(dir.path()), "https://www.icloud.com", "cid-1").unwrap();
+        first.import_cookies(&[make_cookie("old")]);
+        first.flush().unwrap();
+        assert!(!first.has_newer_on_disk());
+        assert!(!first.reload_from_disk_if_newer());
+
+        // Another process signs in and saves a newer, longer cookie value.
+        let writer = Session::open("unknown", None, "https://www.icloud.com", "cid-2").unwrap();
+        writer.import_cookies(&[make_cookie("fresh-longer-token")]);
+        writer.save_as("me@example.com", dir.path()).unwrap();
+
+        assert!(first.has_newer_on_disk());
+        assert!(first.reload_from_disk_if_newer());
+        assert_eq!(first.cookie("X-APPLE-WEBAUTH-TOKEN").as_deref(), Some("fresh-longer-token"));
+        assert_eq!(first.data().client_id.as_deref(), Some("cid-2"));
+        assert!(!first.has_newer_on_disk());
+    }
+
+    #[test]
+    fn expired_session_reasons_and_transient_errors_are_classified_accurately() {
+        for reason in ["Missing X-APPLE-WEBAUTH-USER cookie", "Invalid session", "Session expired"] {
+            assert!(make_api_error(None, reason.into()).is_auth(), "{reason}");
+        }
+        let unauthorized = Error::Status { status: 401, reason: "Unauthorized".into() };
+        assert!(unauthorized.may_be_session_expired());
+        assert!(!unauthorized.is_auth());
+
+        let unavailable = Error::Status { status: 503, reason: "Service Unavailable".into() };
+        assert!(unavailable.is_transient());
+        assert!(!unavailable.is_auth());
     }
 }

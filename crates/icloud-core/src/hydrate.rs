@@ -86,6 +86,8 @@ pub struct Selection {
     pub outside: Vec<PathBuf>,
     /// Picked items that do not exist (any more).
     pub missing: Vec<PathBuf>,
+    /// Folders that could not be listed (e.g. offline or expired session).
+    pub unreadable: Vec<(PathBuf, String)>,
 }
 
 /// Resolve `picked` (absolute, or relative to `cwd`) against the mount.
@@ -110,7 +112,7 @@ pub fn resolve_selection(mount: &Path, picked: &[PathBuf], cwd: &Path) -> std::i
             continue;
         };
         if real.is_dir() {
-            walk(&real, &start, &mut selection.files);
+            walk(&real, &start, &mut selection.files, &mut selection.unreadable);
         } else {
             selection.files.push(start);
         }
@@ -120,14 +122,20 @@ pub fn resolve_selection(mount: &Path, picked: &[PathBuf], cwd: &Path) -> std::i
     Ok(selection)
 }
 
-fn walk(dir: &Path, at: &IcPath, files: &mut Vec<IcPath>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+fn walk(dir: &Path, at: &IcPath, files: &mut Vec<IcPath>, unreadable: &mut Vec<(PathBuf, String)>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            unreadable.push((dir.to_owned(), err.to_string()));
+            return;
+        }
+    };
     for entry in entries.flatten() {
         let (Ok(kind), Some(path)) = (entry.file_type(), entry.file_name().to_str().and_then(|n| at.join(n))) else {
             continue;
         };
         if kind.is_dir() {
-            walk(&entry.path(), &path, files);
+            walk(&entry.path(), &path, files, unreadable);
         } else if kind.is_file() {
             files.push(path);
         }
@@ -160,27 +168,78 @@ pub struct Report {
 
 /// Download `plan.pending` by reading each file's first byte through `mount`.
 /// `progress` is called after every file; raising `cancel` stops cleanly.
-pub fn run(mount: &Path, plan: &Plan, cancel: &AtomicBool, mut progress: impl FnMut(&IcPath, Progress)) -> Report {
+pub fn run(mount: &Path, plan: &Plan, cancel: &AtomicBool, progress: impl FnMut(&IcPath, Progress)) -> Report {
+    run_concurrent(mount, plan, 1, cancel, progress)
+}
+
+/// Like [`run`](Self::run), downloading up to `workers` files concurrently so
+/// multi-file selections finish much faster while respecting `cancel`.
+pub fn run_concurrent(
+    mount: &Path,
+    plan: &Plan,
+    workers: usize,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(&IcPath, Progress),
+) -> Report {
     let started = Instant::now();
     let mut report = Report { succeeded: 0, failed: Vec::new(), interrupted: false };
-    for (index, (path, _)) in plan.pending.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            report.interrupted = true;
-            break;
+    let total = plan.pending.len();
+    if total == 0 {
+        return report;
+    }
+    let workers = workers.max(1).min(total);
+    if workers == 1 {
+        for (index, (path, _)) in plan.pending.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                report.interrupted = true;
+                break;
+            }
+            match touch(mount, path) {
+                Ok(()) => report.succeeded += 1,
+                Err(err) => report.failed.push((path.clone(), err.to_string())),
+            }
+            progress(
+                path,
+                Progress { done: index + 1, failed: report.failed.len(), total, elapsed: started.elapsed() },
+            );
         }
-        match touch(mount, path) {
-            Ok(()) => report.succeeded += 1,
-            Err(err) => report.failed.push((path.clone(), err.to_string())),
+        return report;
+    }
+
+    let next_index = std::sync::atomic::AtomicUsize::new(0);
+    let (tx, rx) = std::sync::mpsc::channel::<(IcPath, std::io::Result<()>)>();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let next_index = &next_index;
+            scope.spawn(move || {
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let idx = next_index.fetch_add(1, Ordering::Relaxed);
+                    let Some((path, _)) = plan.pending.get(idx) else { break };
+                    let outcome = touch(mount, path);
+                    if tx.send((path.clone(), outcome)).is_err() {
+                        break;
+                    }
+                }
+            });
         }
-        progress(
-            path,
-            Progress {
-                done: index + 1,
-                failed: report.failed.len(),
-                total: plan.pending.len(),
-                elapsed: started.elapsed(),
-            },
-        );
+        drop(tx);
+        for (index, (path, outcome)) in rx.into_iter().enumerate() {
+            match outcome {
+                Ok(()) => report.succeeded += 1,
+                Err(err) => report.failed.push((path.clone(), err.to_string())),
+            }
+            progress(
+                &path,
+                Progress { done: index + 1, failed: report.failed.len(), total, elapsed: started.elapsed() },
+            );
+        }
+    });
+    if cancel.load(Ordering::Relaxed) && report.succeeded + report.failed.len() < total {
+        report.interrupted = true;
     }
     report
 }
@@ -333,5 +392,31 @@ mod tests {
         let p = Progress { done: 10, failed: 0, total: 30, elapsed: Duration::from_secs(20) };
         assert_eq!(p.eta().map(|d| d.as_secs()), Some(40));
         assert_eq!(Progress { done: 3, failed: 3, total: 9, elapsed: Duration::from_secs(1) }.eta(), None);
+    }
+
+    #[test]
+    fn concurrent_run_downloads_all_files_and_collects_failures() {
+        let mount = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(mount.path().join(name), name.as_bytes()).unwrap();
+        }
+        let plan = Plan {
+            pending: vec![
+                (IcPath::new("/a.txt"), 5),
+                (IcPath::new("/b.txt"), 5),
+                (IcPath::new("/missing.txt"), 5),
+                (IcPath::new("/c.txt"), 5),
+            ],
+            already_local: 0,
+            excluded: 0,
+        };
+        let mut last_done = 0;
+        let report = run_concurrent(mount.path(), &plan, 3, &AtomicBool::new(false), |_, p| {
+            last_done = p.done;
+        });
+        assert_eq!(report.succeeded, 3);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(last_done, 4);
+        assert!(!report.interrupted);
     }
 }

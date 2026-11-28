@@ -48,6 +48,7 @@ pub enum Activity {
     Listing(String),
     Listed { name: String, items: u64 },
     Downloading(String),
+    DownloadingProgress { name: String, percent: u8 },
     Downloaded(String),
     Syncing(String),
     Synced(String),
@@ -60,6 +61,7 @@ impl Activity {
             Self::Listing(name) => format!("listing: {name}"),
             Self::Listed { name, items } => format!("{name}: {items} item{}", if *items == 1 { "" } else { "s" }),
             Self::Downloading(name) => format!("downloading: {name}"),
+            Self::DownloadingProgress { name, percent } => format!("downloading: {name} · {percent}%"),
             Self::Downloaded(name) => format!("{name} downloaded"),
             Self::Syncing(name) => format!("syncing: {name}"),
             Self::Synced(name) => format!("{name} synced"),
@@ -135,11 +137,24 @@ pub fn parse_line(line: &str) -> Option<Activity> {
             Some(Activity::Listed { name: name(), items: get("entries").and_then(|n| n.parse().ok()).unwrap_or(0) })
         }
         "hydrate-start" => Some(Activity::Downloading(name())),
+        "hydrate-progress" => {
+            let bytes = get("bytes").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+            let total = get("total").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+            if let Some(pct) = bytes.saturating_mul(100).checked_div(total) {
+                Some(Activity::DownloadingProgress { name: name(), percent: pct.min(100) as u8 })
+            } else {
+                Some(Activity::Downloading(name()))
+            }
+        }
         "hydrate-complete" => Some(Activity::Downloaded(name())),
         "file-sync-start" => Some(Activity::Syncing(name())),
         "file-sync-complete" => Some(Activity::Synced(name())),
         _ => None,
     }
+}
+
+fn is_download_failed(line: &str) -> bool {
+    line.find("sync ").map(|at| &line[at + "sync ".len()..]).is_some_and(|rest| rest.starts_with("hydrate-failed"))
 }
 
 /// Follows a log file and remembers the latest activity.
@@ -199,6 +214,8 @@ impl StatusMonitor {
         for line in complete.lines() {
             if let Some(activity) = parse_line(line) {
                 self.last = Some((activity, now));
+                changed = true;
+            } else if is_download_failed(line) && self.last.take().is_some() {
                 changed = true;
             }
         }
@@ -637,5 +654,24 @@ mod tests {
         handle.join().unwrap();
         assert!(asked.elapsed() < Duration::from_secs(2));
         assert!(!fs::read_to_string(layout.bookmarks_file()).unwrap().contains("Live"));
+    }
+
+    #[test]
+    fn download_progress_updates_percentage_and_failure_clears_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("icloud.log");
+        let mut monitor = StatusMonitor::following(&log);
+        let now = t0();
+        append(&log, "sync hydrate-start path='/Movies/clip.mp4' size=1000\n");
+        assert!(monitor.poll(&log, now));
+        assert_eq!(monitor.label_suffix(), " (downloading: clip.mp4)");
+
+        append(&log, "sync hydrate-progress path='/Movies/clip.mp4' bytes=500 total=1000\n");
+        assert!(monitor.poll(&log, now + Duration::from_secs(2)));
+        assert_eq!(monitor.label_suffix(), " (downloading: clip.mp4 · 50%)");
+
+        append(&log, "sync hydrate-failed path='/Movies/clip.mp4'\n");
+        assert!(monitor.poll(&log, now + Duration::from_secs(3)));
+        assert_eq!(monitor.label_suffix(), "");
     }
 }

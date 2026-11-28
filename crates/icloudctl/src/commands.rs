@@ -241,7 +241,7 @@ fn hydrate_command(ctx: &mut Context<'_>, dry_run: bool, verbose: bool) -> Resul
     ctx.ui.say("\nDownloading; press Ctrl-C to pause (safe to re-run).");
     let mut last_report = std::time::Instant::now();
     let ui = &mut *ctx.ui;
-    let report = hydrate::run(&mount, &plan, &cancel, |path, progress| {
+    let report = hydrate::run_concurrent(&mount, &plan, 3, &cancel, |path, progress| {
         if verbose {
             ui.say(&format!("  [{}/{}] {path}", progress.done, progress.total));
         }
@@ -330,11 +330,16 @@ fn download_selection(
     let cwd = std::env::current_dir()?;
     let selection = hydrate::resolve_selection(&mount, &picked, &cwd)?;
     if selection.files.is_empty() {
-        return Err(Error::Setup(if selection.outside.is_empty() {
+        return Err(Error::Setup(if let Some((dir, why)) = selection.unreadable.first() {
+            format!("could not list {}: {why}", dir.display())
+        } else if selection.outside.is_empty() {
             "there is no file to download in the selection".into()
         } else {
             format!("not inside iCloud Drive ({}): nothing to download", mount.display())
         }));
+    }
+    for (dir, why) in &selection.unreadable {
+        ctx.ui.say(&format!("Skipped {}: could not list folder ({why}).", dir.display()));
     }
     for item in &selection.outside {
         ctx.ui.say(&format!("Skipped {}: not inside iCloud Drive.", item.display()));
@@ -359,7 +364,7 @@ fn download_selection(
         signal_hook::flag::register(signal, Arc::clone(&cancel))?;
     }
     let ui = &mut *ctx.ui;
-    let report = hydrate::run(&mount, &plan, &cancel, |path, progress| {
+    let report = hydrate::run_concurrent(&mount, &plan, 3, &cancel, |path, progress| {
         ui.say(&format!("  [{}/{}] {path}", progress.done, progress.total));
     });
 

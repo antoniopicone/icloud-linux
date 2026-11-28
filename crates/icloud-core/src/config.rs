@@ -205,14 +205,33 @@ impl Config {
 
 /// Atomically write `bytes` to `path` with mode 0600.
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+    let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("config");
+    let pid = std::process::id();
+    let tmp = loop {
+        let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{base}.{pid}.{seq}.tmp"));
+        match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&candidate) {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(err);
+                }
+                break candidate;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    };
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
     }
-    let tmp = path.with_extension("tmp");
-    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path)
+    Ok(())
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime},
 };
 
 use fuser::{Config as MountConfig, MountOption, Session, SessionACL};
@@ -14,6 +14,7 @@ use icloud_core::{
     connect::{Connection, connect},
     notify::{DesktopNotifier, FailureReporter},
     setup::cleanup_mountpoint,
+    thumbnails,
 };
 use signal_hook::{
     consts::{SIGINT, SIGTERM, SIGUSR1},
@@ -29,6 +30,12 @@ const FUSE_THREADS: usize = 16;
 /// from an open tab; a session left alone lapses within about half an hour,
 /// and the next file opened would wait for it to be renewed first.
 const SESSION_RENEW_INTERVAL: Duration = Duration::from_secs(300);
+/// Poll slice for the session keep-alive thread, so shutdown is prompt and
+/// wake-from-sleep or a fresh `icloudctl auth` on disk is noticed quickly.
+const SESSION_POLL_SLICE: Duration = Duration::from_secs(5);
+/// Initial retry delay when a renewal fails due to a transient network outage
+/// (e.g. Wi-Fi reconnecting after boot or laptop wake).
+const SESSION_RETRY_INITIAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -53,19 +60,36 @@ pub fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(SyncState::open(&config.state_db())?);
     let policy = SyncPolicy::new(&config.sync_paths, &config.exclude_paths);
 
-    let (engine, client, icloud_session) = match connect(&config)? {
-        Connection::Ready { drive, session: icloud_session, client } => {
+    let (engine, client, icloud_session, started_offline) = match connect(&config)? {
+        Connection::Ready { drive, session: icloud_session, client, started_offline } => {
             let engine =
                 Engine::new(drive, mirror.clone(), state.clone(), policy.clone(), EngineConfig::from_config(&config));
+            // Whenever a file is hydrated (opened directly or via `icloudctl download`),
+            // clear any stale thumbnail-failure note so Files draws its preview.
+            if let Some(cache_home) = layout.cache_dir.parent().map(Path::to_path_buf) {
+                let mount = options.mountpoint.clone();
+                let real_mount = fs::canonicalize(&mount).unwrap_or_else(|_| mount.clone());
+                engine.set_on_hydrated(move |path| {
+                    let relative = path.as_str().trim_start_matches('/');
+                    let mut files = vec![mount.join(relative)];
+                    if real_mount != mount {
+                        files.push(real_mount.join(relative));
+                    }
+                    let cleared = thumbnails::forget_failures(&cache_home, &files);
+                    if cleared > 0 {
+                        tracing::debug!("cleared {cleared} thumbnail failure note(s) for {path}");
+                    }
+                });
+            }
             engine.start()?;
-            (Some(engine), Some(client), Some(icloud_session))
+            (Some(engine), Some(client), Some(icloud_session), started_offline)
         }
         Connection::Unauthenticated { reason } => {
             tracing::error!(
                 "starting UNAUTHENTICATED: {reason}. The cache is served read-only. \
                  Run `icloudctl auth` to sign in again."
             );
-            (None, None, None)
+            (None, None, None, false)
         }
     };
 
@@ -106,27 +130,100 @@ pub fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    // Keep the web session alive, and its file fresh: each renewal is saved.
-    if let Some(icloud_session) = icloud_session {
-        thread::Builder::new().name("icloud-session".into()).spawn(move || {
-            loop {
-                thread::sleep(SESSION_RENEW_INTERVAL);
-                if let Err(err) = icloud_session.renew_now() {
-                    tracing::warn!("could not renew the iCloud session: {err}");
-                }
-            }
-        })?;
-    }
+    // Keep the web session alive, react to laptop wake-from-sleep, reconnect
+    // after offline startup, and pick up a fresh `icloudctl auth` written to disk.
+    let session_thread = if let (Some(icloud_session), Some(session_engine), Some(session_client)) =
+        (icloud_session, engine.clone(), client.clone())
+    {
+        Some(thread::Builder::new().name("icloud-session".into()).spawn(move || {
+            run_session_keepalive(&session_engine, &icloud_session, &session_client, started_offline);
+        })?)
+    } else {
+        None
+    };
 
     let outcome = session.run();
 
     if let Some(engine) = &engine {
         engine.shutdown_and_wait(Duration::from_secs(2));
     }
+    if let Some(handle) = session_thread {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+    }
     if let Some(Err(err)) = client.as_ref().map(|c| c.session().flush()) {
         tracing::warn!("could not save the iCloud session: {err}");
     }
     outcome.map_err(Into::into)
+}
+
+fn run_session_keepalive(
+    engine: &Engine,
+    icloud_session: &icloud_api::RenewingDrive<icloud_api::HttpDrive>,
+    client: &icloud_api::Client,
+    started_offline: bool,
+) {
+    let mut transient_failures: u32 = 0;
+    let mut next_wait = if started_offline { SESSION_RETRY_INITIAL } else { SESSION_RENEW_INTERVAL };
+    let mut last_attempt = Instant::now();
+    let mut last_wall = SystemTime::now();
+
+    while !engine.is_stopped() {
+        thread::sleep(SESSION_POLL_SLICE);
+        if engine.is_stopped() {
+            break;
+        }
+        let now_wall = SystemTime::now();
+        let wall_elapsed = now_wall.duration_since(last_wall).unwrap_or(Duration::ZERO);
+        let woke_from_sleep = wall_elapsed >= SESSION_RENEW_INTERVAL;
+        let newer_on_disk = client.session().has_newer_on_disk();
+
+        // Once auth is known to be lost, stop polling Apple every few minutes;
+        // wait until a fresh sign-in writes newer cookies to disk.
+        if engine.auth_lost() && !newer_on_disk {
+            last_wall = now_wall;
+            continue;
+        }
+
+        let due = newer_on_disk || woke_from_sleep || last_attempt.elapsed() >= next_wait;
+        if !due {
+            continue;
+        }
+        if woke_from_sleep && !newer_on_disk {
+            tracing::info!(
+                "system clock jumped by {}s; proactively renewing the iCloud session",
+                wall_elapsed.as_secs()
+            );
+        }
+
+        last_attempt = Instant::now();
+        last_wall = now_wall;
+        match icloud_session.renew_now() {
+            Ok(()) => {
+                engine.clear_auth_lost();
+                transient_failures = 0;
+                next_wait = SESSION_RENEW_INTERVAL;
+            }
+            Err(err) if err.is_auth() => {
+                tracing::warn!("could not renew the iCloud session: {err}");
+                engine.mark_auth_lost();
+                transient_failures = 0;
+                next_wait = SESSION_RENEW_INTERVAL;
+            }
+            Err(err) => {
+                // Transient network/server issue: exponential backoff from 15s up to 5m.
+                transient_failures = transient_failures.saturating_add(1);
+                let mult = 1u32 << transient_failures.saturating_sub(1).min(5);
+                next_wait = (SESSION_RETRY_INITIAL * mult).min(SESSION_RENEW_INTERVAL);
+                tracing::warn!("could not renew the iCloud session ({err}); retrying in {}s", next_wait.as_secs());
+            }
+        }
+    }
 }
 
 /// `SIGUSR1`: refresh from iCloud now, then tell `icloudctl sync` how it went.
